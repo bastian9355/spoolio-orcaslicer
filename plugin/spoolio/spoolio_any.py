@@ -276,6 +276,45 @@ def stats_settings() -> dict:
     return parse_stats(cfg().get("stats"))
 
 
+FONTS = ("def", "sans", "wide", "serif", "mono")
+SIZES = (90, 100, 115, 130)
+
+
+THEMES = {
+    "light": {"accent": "#00897b", "accentFg": "#ffffff", "bg": "#f3f4f6", "card": "#ffffff", "border": "#d8dbe0",
+              "fg": "#1f2328", "muted": "#626a74", "radius": 14},
+    "dark": {"accent": "#009688", "accentFg": "#ffffff", "bg": "#2b2b2e", "card": "#333336", "border": "#45454a",
+             "fg": "#e8e8e8", "muted": "#9a9a9e", "radius": 14},
+}
+SHOW = ("tag", "mat", "hex", "dia", "loc", "rfid", "cart")
+LOOK_PICKS = {"theme": ("dark", "light", "custom"), "density": ("comfy", "compact", "spacious"),
+              "cols": ("1", "2", "auto"), "swatch": ("circle", "spool", "square", "pill"),
+              "units": ("g", "kg", "oz"), "wfmt": ("both", "w", "pct")}
+WFMT = {"grams": "w", "percent": "pct", "both": "both"}
+
+
+def parse_look(value: object, legacy: dict | None = None) -> dict:
+    """Appearance settings; columns and weight display fall back to the older General settings."""
+    v = value if isinstance(value, dict) else {}
+    old = legacy or {}
+    size = _num_or(v.get("size"), 100)
+    out = {"font": v.get("font") if v.get("font") in FONTS else "def", "size": size if size in SIZES else 100}
+    dflt = {"cols": "2" if old.get("spool_columns") in (2, "2") else "1",
+            "wfmt": WFMT.get(old.get("weight_display"), "both")}
+    for k, opts in LOOK_PICKS.items():
+        x = str(v.get(k)) if v.get(k) is not None else None
+        out[k] = x if x in opts else dflt.get(k, opts[0])
+    c = v.get("custom") if isinstance(v.get("custom"), dict) else {}
+    out["custom"] = {k: (str(c[k]).lower() if re.fullmatch(r"#[0-9A-Fa-f]{6}", str(c.get(k))) else d)
+                     for k, d in THEMES["dark"].items() if k != "radius"}
+    out["custom"]["radius"] = c.get("radius") if c.get("radius") in (4, 10, 14, 20) else 14
+    s = v.get("show") if isinstance(v.get("show"), dict) else {}
+    out["show"] = {k: parse_flag(s.get(k), default=k != "loc") for k in SHOW}
+    out["motion"] = parse_flag(v.get("motion"), default=False)
+    out["cb"] = parse_flag(v.get("cb"), default=False)
+    return out
+
+
 def plate_settings() -> tuple[bool, int]:
     settings = cfg()
     return (parse_flag(settings.get("plate_check")),
@@ -295,6 +334,7 @@ def ui_cfg() -> dict:
         "spool_columns": parse_columns(s.get("spool_columns")),
         "progress": parse_progress(s.get("progress")),
         "stats": parse_stats(s.get("stats")),
+        "appearance": parse_look(s.get("appearance"), s),
     }
 
 
@@ -2282,6 +2322,232 @@ def _spoolman_error(exc: Exception) -> str:
     return str(exc)
 
 
+def sm_req(method: str, path: str, body: object = None):
+    url = f"{clean_url(cfg().get('spoolman_url'))}/api/v1/{path}"
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        raw = resp.read()
+    return json.loads(raw.decode("utf-8")) if raw else None
+
+
+def _sm_err(exc: Exception) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            msg = json.loads(exc.read().decode("utf-8")).get("message")
+        except Exception:
+            msg = None
+        return f"Spoolman refused it: {msg}" if isinstance(msg, str) and msg else _spoolman_error(exc)
+    return _spoolman_error(exc)
+
+
+CUR_SIGNS = {"EUR": "€", "GBP": "£", "USD": "$"}
+FIELD_TYPES = ("text", "integer", "integer_range", "float", "float_range", "datetime", "boolean", "choice")
+_ext_cache: dict = {"url": "", "time": 0.0, "items": []}
+
+
+def _num_or(value: object, default=None):
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return default
+    return int(n) if n == int(n) else n
+
+
+def _first_hex(f: dict) -> str:
+    c = f.get("color_hex")
+    if not c:
+        m = f.get("multi_color_hexes") or f.get("color_hexes") or ""
+        c = (m if isinstance(m, list) else str(m).split(","))[0] if m else ""
+    return _hex6(c)
+
+
+def _fil(f: dict) -> dict:
+    return {"id": f.get("id"), "v": (f.get("vendor") or {}).get("name") or "", "n": f.get("name") or "",
+            "m": f.get("material") or "", "c": _first_hex(f), "w": f.get("weight"), "sw": f.get("spool_weight"),
+            "d": f.get("density"), "dia": f.get("diameter"), "e": f.get("settings_extruder_temp"),
+            "b": f.get("settings_bed_temp")}
+
+
+def _ext(f: dict) -> dict:
+    return {"x": f.get("id"), "v": f.get("manufacturer") or "", "n": f.get("name") or "", "m": f.get("material") or "",
+            "c": _first_hex(f), "w": f.get("weight"), "sw": f.get("spool_weight"), "d": f.get("density"),
+            "dia": f.get("diameter"), "e": f.get("extruder_temp"), "b": f.get("bed_temp")}
+
+
+def editor_data() -> dict:
+    """Extra field definitions, manufacturers and filaments for the spool card."""
+    try:
+        fields = sm_req("GET", "field/spool") or []
+        vendors = sm_req("GET", "vendor") or []
+        fils = sm_req("GET", "filament") or []
+    except Exception as exc:
+        log.warning("Spool card data failed: %s", exc)
+        return {"ok": False, "error": _sm_err(exc)}
+    code = spoolman_currency(clean_url(cfg().get("spoolman_url")))
+    out = []
+    for f in sorted(fields, key=lambda x: (x.get("order") or 0, x.get("name") or "")):
+        if isinstance(f, dict) and f.get("key") and f.get("field_type") in FIELD_TYPES:
+            out.append({"key": f["key"], "name": f.get("name") or f["key"], "type": f["field_type"],
+                        "unit": f.get("unit") or "", "choices": f.get("choices") or [],
+                        "multi": bool(f.get("multi_choice"))})
+    return {"ok": True, "fields": out, "cur": CUR_SIGNS.get(code, code),
+            "vendors": sorted({v.get("name") for v in vendors if isinstance(v, dict) and v.get("name")}, key=str.lower),
+            "filaments": [_fil(f) for f in fils if isinstance(f, dict) and not f.get("archived")]}
+
+
+def catalogue(query: object) -> dict:
+    """Spoolman's own filament catalogue, searched here so any Spoolman version works."""
+    url = clean_url(cfg().get("spoolman_url"))
+    if _ext_cache["url"] != url or time.monotonic() - _ext_cache["time"] > 3600 or not _ext_cache["items"]:
+        try:
+            items = sm_req("GET", "external/filament") or []
+        except Exception as exc:
+            return {"ok": False, "error": _sm_err(exc), "items": []}
+        _ext_cache.update(url=url, time=time.monotonic(), items=[_ext(f) for f in items if isinstance(f, dict)])
+    words = str(query or "").lower().split()
+    hits = [f for f in _ext_cache["items"] if all(w in f"{f['v']} {f['n']} {f['m']}".lower() for w in words)]
+    return {"ok": True, "items": hits[:60], "more": len(hits) > 60}
+
+
+def _vendor_id(name: str) -> int | None:
+    name = name.strip()
+    if not name:
+        return None
+    for v in sm_req("GET", "vendor") or []:
+        if str(v.get("name") or "").strip().lower() == name.lower():
+            return v["id"]
+    return sm_req("POST", "vendor", {"name": name})["id"]
+
+
+FIL_KEYS = {"name": "name", "material": "material", "color_hex": "color_hex", "diameter": "diameter",
+            "density": "density", "ext": "settings_extruder_temp", "bed": "settings_bed_temp",
+            "weight": "weight", "spool_weight": "spool_weight", "external_id": "external_id"}
+FIL_NUM = ("diameter", "density", "ext", "bed", "weight", "spool_weight")
+SPOOL_KEYS = ("remaining_weight", "initial_weight", "spool_weight", "location", "lot_nr", "price", "comment")
+
+
+def _fil_body(f: dict) -> dict:
+    body = {}
+    for k, v in f.items():
+        if k == "vendor":
+            body["vendor_id"] = _vendor_id(str(v or ""))
+        elif k in FIL_KEYS:
+            if k in FIL_NUM:
+                v = _num_or(v)
+            elif k == "color_hex":
+                v = _hex6(v) or None
+            else:
+                v = str(v).strip()[:256] if v not in (None, "") else None
+            body[FIL_KEYS[k]] = v
+    return body
+
+
+def _extra_raw(sent: dict, raw: dict) -> dict:
+    out = dict(raw)
+    for k, v in sent.items():
+        if v in ("", None, []) or (isinstance(v, list) and all(x in ("", None) for x in v)):
+            out.pop(k, None)
+        else:
+            out[k] = json.dumps(v)
+    return out
+
+
+def spool_save(d: dict) -> dict:
+    """Add a spool, or save edits to one, in Spoolman."""
+    sid, fid, made = _int(d.get("id"), 0), _int(d.get("fid"), 0), False
+    fil = d.get("fil") if isinstance(d.get("fil"), dict) else {}
+    sp = d.get("spool") if isinstance(d.get("spool"), dict) else {}
+    extra = d.get("extra") if isinstance(d.get("extra"), dict) else {}
+    try:
+        if extra.get("tag") and "tag" not in {f.get("key") for f in sm_req("GET", "field/spool") or []}:
+            sm_req("POST", "field/spool/tag", {"name": "tag", "field_type": "text"})
+        if fid <= 0:
+            body = {k: v for k, v in _fil_body(fil).items() if v is not None}
+            body.setdefault("density", 1.24)
+            body.setdefault("diameter", 1.75)
+            if not body.get("name"):
+                return {"ok": False, "error": "The filament needs a name."}
+            fid, made = sm_req("POST", "filament", body)["id"], True
+        elif fil:
+            sm_req("PATCH", f"filament/{fid}", _fil_body(fil))
+        body = {}
+        for k in SPOOL_KEYS:
+            if k in sp:
+                v = sp[k]
+                body[k] = (_num_or(v) if k not in ("location", "lot_nr", "comment")
+                           else str(v).strip()[:1024] if v not in (None, "") else None)
+        if sid:
+            raw = (sm_req("GET", f"spool/{sid}") or {}).get("extra") or {}
+            if extra:
+                body["extra"] = _extra_raw(extra, raw)
+            if body:
+                sm_req("PATCH", f"spool/{sid}", body)
+        else:
+            body = {k: v for k, v in body.items() if v is not None}
+            body["filament_id"] = fid
+            if extra:
+                body["extra"] = _extra_raw(extra, {})
+            sid = sm_req("POST", "spool", body)["id"]
+    except Exception as exc:
+        log.warning("Saving a spool to Spoolman failed: %s", exc)
+        return {"ok": False, "error": _sm_err(exc)}
+    _spool_cache["time"] = 0.0
+    log.info("Spool #%s %s in Spoolman%s", sid, "saved" if d.get("id") else "added", " (new filament)" if made else "")
+    return {"ok": True, "id": sid, "made": made, "added": not d.get("id")}
+
+
+def new_skip(uid: object) -> None:
+    ids = _tag_ids(uid)
+    if ids:
+        def put(s):
+            s["new_skip"] = (list(s.get("new_skip") or []) + sorted(ids))[-200:]
+        cfg_edit(put)
+
+
+def _where(unit_id: int, slot: int) -> str:
+    if unit_id == 254:
+        return "External Spool"
+    if unit_id >= 128:
+        return f"AMS HT {unit_id - 127}"
+    return f"AMS {unit_id + 1} · Slot {slot + 1}"
+
+
+def new_spools() -> list[dict]:
+    """Bambu RFID spools in a live printer that no Spoolman spool has the tag of."""
+    url = cfg().get("spoolman_url", "")
+    if source() != "spoolman" or not url or _spool_cache["url"] != url:
+        return []
+    known = set()
+    for sp in _spool_cache["spools"]:
+        known |= spool_tags(sp)
+    skip = set(cfg().get("new_skip") or [])
+    out = []
+    with _live_lock:
+        for dev_id, st in _live["printers"].items():
+            if st.get("kind") == "net":
+                continue
+            trays = [(u, i, t) for u in sorted(st["units"]) for i, t in sorted(st["units"][u].items())]
+            if st["ext"]:
+                trays.append((254, 0, st["ext"]))
+            for unit_id, slot, t in trays:
+                ids = _tag_ids(t.get("tray_uuid"))
+                if not ids or ids & known or ids & skip or not str(t.get("tray_type") or "").strip():
+                    continue
+                lo, hi = _int(t.get("nozzle_temp_min"), 0), _int(t.get("nozzle_temp_max"), 0)
+                remain = t.get("remain")
+                out.append({"uid": sorted(ids)[0], "printer": st["name"], "where": _where(unit_id, slot),
+                            "unit": "AMS HT" if 128 <= unit_id < 254 else f"AMS {unit_id + 1}" if unit_id < 128 else "",
+                            "name": str(t.get("tray_sub_brands") or t.get("tray_type")).strip(),
+                            "m": str(t.get("tray_type")).strip(), "c": _hex6(t.get("tray_color")),
+                            "pct": remain if isinstance(remain, (int, float)) and 0 <= remain <= 100 else None,
+                            "w": _int(t.get("tray_weight"), 0) or 1000,
+                            "dia": _num_or(t.get("tray_diameter"), 1.75) or 1.75,
+                            "e": round((lo + hi) / 2) if lo and hi else (hi or None),
+                            "b": _int(t.get("bed_temp"), 0) or None})
+    return out
+
+
 _booking: set = set()
 
 
@@ -3228,8 +3494,9 @@ MAIN_PAGE = """
   .spool-body { display: flex; gap: 11px; align-items: flex-start; }
   .spool-swatch-col {
     display: flex; flex-direction: column; align-items: center; gap: 4px;
-    flex-shrink: 0; padding-top: 1px;
+    flex-shrink: 0; padding-top: 1px; position: relative;
   }
+  .spool-swatch-col .spool-rfid { position: absolute; left: 50%; top: 100%; transform: translate(-50%, -55%); z-index: 1; }
   .spool-swatch {
     width: 42px; height: 42px; border-radius: 50%; flex-shrink: 0;
     border: 2px solid rgba(255, 255, 255, 0.1);
@@ -3257,6 +3524,17 @@ MAIN_PAGE = """
     background: transparent; color: #e0a030; border: 1px solid currentColor;
   }
   .spool-cart:hover { background: rgba(224, 160, 48, 0.18); }
+  #list .spool-cart { margin: -2px 0; }
+  .spool-tline { display: flex; align-items: baseline; min-width: 0; }
+  .spool-tline .spool-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .spool-tline .spool-dup { flex-shrink: 0; margin-top: -3px; margin-bottom: -3px; }
+  .spool-edit {
+    flex-shrink: 0; margin-left: 8px; padding: 0; border: 0; line-height: 0; cursor: pointer;
+    background: none; color: var(--orca-muted);
+  }
+  .spool-edit:hover { background: none; color: var(--orca-accent); }
+  .spool-edit svg { width: 14px; height: 14px; }
+  #add-spool { margin-left: auto; padding: 7px 14px; border-radius: 6px; font-size: 13px; font-weight: 700; }
   .spool-cart svg { width: 13px; height: 13px; }
   .spool-bar-track {
     height: 5px; border-radius: 3px; margin: 6px 0 5px;
@@ -3336,7 +3614,8 @@ MAIN_PAGE = """
   .group-card .group-bar-fill.low { background: #d9534f; }
   .group-items { padding-left: 4px; }
   .group.collapsed .group-items { display: none; }
-  #list.cols-2, #list.cols-2 .group-items { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 10px; align-items: start; }
+  #list.cols-2, #list.cols-2 .group-items { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 10px; align-items: stretch; }
+  #list.cols-2 .spool-card { height: calc(100% - 10px); box-sizing: border-box; }
   #list.cols-2 > .group, #list.cols-2 > .empty { grid-column: 1 / -1; }
   #list.cols-2 .group.collapsed .group-items { display: none; }
   @media (max-width: 640px) { #list.cols-2, #list.cols-2 .group-items { grid-template-columns: minmax(0, 1fr); } }
@@ -3566,6 +3845,7 @@ MAIN_PAGE = """
   <div id="page-spools">
   <div class="listbar">
     <div id="status">Loading...</div>
+    <button id="add-spool" title="Add a Spool to Spoolman" hidden>+ Add Spool</button>
     <button id="filters-toggle" aria-expanded="false">Filters &#9662;</button>
   </div>
   <div id="filters-panel" hidden>
@@ -3638,6 +3918,20 @@ MAIN_PAGE = """
     let lowStockGrams = __LOW_STOCK_DEFAULT__;
     let wMode = "both";
     let cart = false;
+    let canEdit = false;
+    let units = "g";
+    let show = { mat: true, hex: true, dia: true, loc: false };
+    let colsMode = "1";
+    function setCols() {
+      if (window.__spoolioAp) listEl.classList.toggle("cols-2", colsMode === "2" || (colsMode === "auto" && window.innerWidth >= 900));
+    }
+    window.addEventListener("resize", setCols);
+    window.__spoolioRelook = function (a) {
+      wMode = { w: "grams", pct: "percent", both: "both" }[a.wfmt] || "both";
+      units = a.units; show = a.show; colsMode = a.cols;
+      setCols();
+      if (allSpools.length) applyFilters();
+    };
     let sortDir = "asc";
     let plate = null;
     let plateSlots = new Map();
@@ -4347,7 +4641,7 @@ MAIN_PAGE = """
     }
     setInterval(pollLive, 5000);
     setInterval(function () {
-      if (liveOn && usage.enabled && tab !== "printer") orca.postMessage({ type: "live" });
+      if (liveOn && (usage.enabled || canEdit) && tab !== "printer") orca.postMessage({ type: "live" });
     }, 30000);
 
     function updateTabs() {
@@ -4819,6 +5113,8 @@ MAIN_PAGE = """
 
     function formatWeight(grams) {
       if (typeof grams !== "number") return "?";
+      if (units === "kg") return (grams / 1000).toFixed(Math.abs(grams) < 100 ? 3 : 2) + " kg";
+      if (units === "oz") return (grams / 28.3495).toFixed(1) + " oz";
       return Math.abs(grams) >= 1000
         ? (grams / 1000).toFixed(2) + " kg"
         : Math.round(grams) + " g";
@@ -4885,9 +5181,10 @@ MAIN_PAGE = """
       const material = filament.material || "";
       const vendorName = vendor.name || "";
       const subtitleParts = [];
-      if (material) subtitleParts.push(material);
-      if (filament.color_hex) subtitleParts.push("#" + filament.color_hex.replace(/^#/, "").toUpperCase());
-      if (typeof filament.diameter === "number") subtitleParts.push(filament.diameter + "mm");
+      if (material && show.mat) subtitleParts.push(material);
+      if (filament.color_hex && show.hex) subtitleParts.push("#" + filament.color_hex.replace(/^#/, "").toUpperCase());
+      if (typeof filament.diameter === "number" && show.dia) subtitleParts.push(filament.diameter + "mm");
+      if (s.location && show.loc) subtitleParts.push("📍 " + s.location);
       const subtitle = subtitleParts.join(" \\u00b7 ");
       const tags = tagUids(s);
       const original = originalWeight(s);
@@ -4929,6 +5226,12 @@ MAIN_PAGE = """
               '<path d="M2 3h3l2.4 12.2a1.5 1.5 0 0 0 1.5 1.2h8.6a1.5 1.5 0 0 0 1.5-1.1L21 8H6"></path>' +
             '</svg></button>'
         : '';
+      const editHtml = canEdit
+        ? '<button class="spool-edit" data-id="' + s.id + '" title="Edit Spool" aria-label="Edit Spool">' +
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+              '<path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16v4z"></path><path d="M13.5 6.5l4 4"></path>' +
+            '</svg></button>'
+        : '';
       const rfidHtml = tags.length
         ? '<div class="spool-rfid" title="RFID: ' + tags.join(", ") + '">' +
             '<span>RFID</span>' +
@@ -4950,7 +5253,7 @@ MAIN_PAGE = """
             '</div>' +
             '<div class="spool-main">' +
               '<div class="spool-top">' +
-                '<div class="spool-title">' + name + dupeHtml + '</div>' +
+                '<div class="spool-title spool-tline"><span class="spool-name">' + name + '</span>' + dupeHtml + editHtml + '</div>' +
                 '<div class="spool-weight' + (tint ? ' low" style="color:' + tint : '') + '">' + wHtml + cartHtml + '</div>' +
               '</div>' +
               '<div class="spool-bar-track" title="' + percentTitle + '">' +
@@ -5089,9 +5392,11 @@ MAIN_PAGE = """
       allSpools = payload.spools || [];
       computeDupes();
       if (typeof payload.low_stock_grams === "number") lowStockGrams = payload.low_stock_grams;
-      if (typeof payload.weight_display === "string") wMode = payload.weight_display;
+      if (typeof payload.weight_display === "string" && !window.__spoolioAp) wMode = payload.weight_display;
       if (typeof payload.show_cart === "boolean") cart = payload.show_cart;
-      if (payload.spool_columns) listEl.classList.toggle("cols-2", payload.spool_columns === 2);
+      canEdit = payload.can_edit === true;
+      document.getElementById("add-spool").hidden = !canEdit;
+      if (payload.spool_columns && !window.__spoolioAp) listEl.classList.toggle("cols-2", payload.spool_columns === 2);
       if (Array.isArray(payload.printers)) cfg = payload.printers;
       if (typeof payload.show_printer_tab === "boolean") showTab = payload.show_printer_tab;
       liveOn = payload.live_ok === true;
@@ -5143,6 +5448,12 @@ MAIN_PAGE = """
       if (btn) {
         orca.postMessage({ type: "order", query: decodeURIComponent(btn.dataset.q) });
       }
+      const ed = e.target.closest(".spool-edit");
+      const sp = ed && allSpools.find(function (s) { return String(s.id) === ed.dataset.id; });
+      if (sp && window.__spoolioEdit) window.__spoolioEdit(sp);
+    });
+    document.getElementById("add-spool").addEventListener("click", function () {
+      if (window.__spoolioEdit) window.__spoolioEdit(null);
     });
 
     searchEl.addEventListener("input", applyFilters);
@@ -5792,6 +6103,7 @@ SETTINGS_PAGE = """
         spool_columns: cPick(),
         progress: progPick(),
         stats: statsPick(),
+        appearance: window.__spoolioLook ? window.__spoolioLook() : null,
       });
     });
     refreshSave();
@@ -6120,6 +6432,907 @@ TAB_BRIDGE = """
 """
 
 
+EDITOR_CSS = """
+  #pc, #pc *, #pt, #pt * { font-family: __FONT__; }
+  #pc { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 1000; padding: 16px; box-sizing: border-box; }
+  #pc[hidden], #pt[hidden] { display: none; }
+  #pc .card { position: relative; width: 860px; max-width: 100%; height: 600px; max-height: 100%; display: flex; flex-direction: column; background: color-mix(in srgb, var(--orca-fg) 4%, var(--orca-bg)); border: 1px solid var(--orca-border); border-radius: 14px; color: var(--orca-fg); font-size: 13px; line-height: 1.4; box-shadow: 0 18px 50px rgba(0,0,0,.45); overflow: hidden; }
+  #pc .top { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--orca-border); }
+  #pc .top h2 { margin: 0; font-size: 16px; font-weight: 700; }
+  #pc .top h2 span { color: var(--orca-muted); font-weight: 500; margin-left: 6px; font-size: 13px; }
+  #pc .x { margin-left: auto; background: none; border: 0; color: var(--orca-muted); font-size: 20px; cursor: pointer; padding: 2px 6px; line-height: 1; }
+  #pc .mid { flex: 1; min-height: 0; display: flex; }
+  #pc .rail { width: 210px; flex-shrink: 0; border-right: 1px solid var(--orca-border); padding: 12px 10px; display: flex; flex-direction: column; gap: 2px; background: color-mix(in srgb, var(--orca-fg) 2%, transparent); }
+  #pc .st { display: flex; gap: 10px; align-items: flex-start; padding: 9px 10px; border-radius: 8px; cursor: pointer; border: 0; background: none; color: inherit; font-size: 13px; text-align: left; width: 100%; }
+  #pc .st:hover { background: color-mix(in srgb, var(--orca-fg) 6%, transparent); }
+  #pc .st.on { background: color-mix(in srgb, var(--orca-accent) 18%, transparent); }
+  #pc .st .n { width: 22px; height: 22px; flex-shrink: 0; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11.5px; font-weight: 700; border: 1.5px solid var(--orca-border); color: var(--orca-muted); }
+  #pc .st.on .n { background: var(--orca-accent); border-color: var(--orca-accent); color: var(--orca-accent-fg); }
+  #pc .st.done .n { border-color: var(--orca-accent); color: #4fd1c5; }
+  #pc .st.chg .n { border-color: #e0a030; color: #f0b545; }
+  #pc .st b { display: block; font-size: 13px; font-weight: 600; }
+  #pc .st.on b { color: #4fd1c5; }
+  #pc .st small { display: block; color: var(--orca-muted); font-size: 11.5px; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 140px; }
+  #pc .mini { margin-top: auto; padding: 10px; border-radius: 10px; border: 1px solid var(--orca-border); display: flex; gap: 10px; align-items: center; }
+  #pc .mini .d { width: 30px; height: 30px; border-radius: 50%; flex-shrink: 0; border: 1px solid rgba(255,255,255,.12); }
+  #pc .mini b { display: block; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 135px; }
+  #pc .mini span { font-size: 11px; color: var(--orca-muted); }
+  #pc .body { flex: 1; min-width: 0; overflow-y: auto; padding: 18px 22px 22px; }
+  #pc .body h3 { margin: 0 0 4px; font-size: 15px; font-weight: 700; color: var(--orca-accent); display: flex; align-items: center; gap: 8px; }
+  #pc .body h3 .emoji { font-size: 19px; }
+  #pc .body .lead { margin: 0 0 14px; color: var(--orca-muted); font-size: 12.5px; }
+  #pc .f2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 14px; }
+  #pc .f3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 14px; }
+  #pc .fl { display: block; margin: 0 0 5px; color: color-mix(in srgb, var(--orca-fg) 82%, var(--orca-bg)); font-size: 12.5px; }
+  #pc .in { position: relative; display: flex; align-items: center; }
+  #pc .in input, #pc .in select, #pc textarea { width: 100%; box-sizing: border-box; padding: 9px 11px; font-size: 13px; background: var(--orca-bg); color: var(--orca-fg); border: 1px solid var(--orca-border); border-radius: 6px; }
+  #pc .in input:focus, #pc .in select:focus, #pc textarea:focus { outline: none; border-color: var(--orca-accent); }
+  #pc .in .u { position: absolute; right: 11px; color: var(--orca-muted); font-size: 12px; pointer-events: none; }
+  #pc .in input[disabled], #pc .in select[disabled] { opacity: .5; }
+  #pc .chg .in input, #pc .chg .in select, #pc .chg textarea { border-color: #e0a030; box-shadow: 0 0 0 1px rgba(224,160,48,.35); }
+  #pc .chg .fl::after { content: "Changed"; margin-left: 6px; font-size: 10px; font-weight: 700; color: #f0b545; }
+  #pc textarea { min-height: 70px; resize: vertical; line-height: 1.45; margin-top: 0; }
+  #pc .seg { display: inline-flex; margin: 0 0 14px; border: 1px solid var(--orca-border); border-radius: 6px; overflow: hidden; }
+  #pc .seg button { margin: 0; padding: 6px 14px; cursor: pointer; border: 0; border-right: 1px solid var(--orca-border); background: transparent; color: var(--orca-fg); font-size: 12.5px; border-radius: 0; }
+  #pc .seg button:last-child { border-right: 0; }
+  #pc .seg button.on { background: var(--orca-accent); color: var(--orca-accent-fg); font-weight: 700; }
+  #pc .ams { display: flex; gap: 12px; align-items: center; padding: 10px 12px; border-radius: 10px; border: 1px solid color-mix(in srgb, var(--orca-accent) 55%, transparent); background: color-mix(in srgb, var(--orca-accent) 9%, transparent); margin-bottom: 14px; }
+  #pc .ams .d { width: 28px; height: 28px; border-radius: 50%; flex-shrink: 0; }
+  #pc .ams span:not(.d) { flex: 1; font-size: 12.5px; }
+  #pc .srch { margin-bottom: 10px; }
+  #pc .ls { border: 1px solid var(--orca-border); border-radius: 10px; overflow: hidden; }
+  #pc .li { display: flex; align-items: center; gap: 12px; padding: 9px 12px; border-top: 1px solid var(--orca-border); cursor: pointer; }
+  #pc .li:first-child { border-top: 0; }
+  #pc .li:hover { background: color-mix(in srgb, var(--orca-fg) 5%, transparent); }
+  #pc .li.on { background: color-mix(in srgb, var(--orca-accent) 15%, transparent); box-shadow: inset 3px 0 0 var(--orca-accent); }
+  #pc .li .d { width: 24px; height: 24px; border-radius: 50%; flex-shrink: 0; border: 1px solid rgba(255,255,255,.12); }
+  #pc .li span:not(.d) { flex: 1; min-width: 0; }
+  #pc .li small { display: block; color: var(--orca-muted); font-size: 11.5px; }
+  #pc .li i { font-style: normal; font-size: 11px; color: var(--orca-muted); }
+  #pc .li.on i { color: #4fd1c5; font-weight: 700; }
+  #pc .note { margin-top: 12px; padding: 9px 12px; border-radius: 8px; background: color-mix(in srgb, var(--orca-fg) 5%, transparent); color: var(--orca-muted); font-size: 12px; line-height: 1.5; }
+  #pc .note.amb { background: rgba(224,160,48,.08); border: 1px solid rgba(224,160,48,.4); color: color-mix(in srgb, var(--orca-fg) 85%, var(--orca-bg)); }
+  #pc .note.bad { background: rgba(217,83,79,.1); border: 1px solid rgba(217,83,79,.45); color: var(--orca-fg); }
+  #pc .lock { display: flex; gap: 10px; align-items: center; }
+  #pc .lock .sb { margin-left: auto; }
+  #pc .col { display: flex; gap: 8px; align-items: center; }
+  #pc .col .sw { width: 36px; height: 36px; flex-shrink: 0; border-radius: 50%; border: 1px solid var(--orca-border); }
+  #pc .meter { height: 8px; border-radius: 4px; background: color-mix(in srgb, var(--orca-fg) 10%, transparent); overflow: hidden; margin-top: 14px; }
+  #pc .meter i { display: block; height: 100%; border-radius: 4px; }
+  #pc .calc { margin-top: 8px; font-size: 12px; color: var(--orca-muted); }
+  #pc .calc b { color: var(--orca-fg); }
+  #pc .tg { display: flex; align-items: center; gap: 10px; padding: 7px 0; cursor: pointer; }
+  #pc .tog { width: 36px; height: 20px; border-radius: 10px; background: #55555b; position: relative; flex-shrink: 0; }
+  #pc .tog::after { content: ""; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: #e8e8e8; transition: left .15s; }
+  #pc .tog.on { background: var(--orca-accent); }
+  #pc .tog.on::after { left: 19px; }
+  #pc .mono { font-family: ui-monospace, Consolas, Menlo, "DejaVu Sans Mono", monospace !important; font-size: 12px; }
+  #pc .sep { height: 1px; background: var(--orca-border); margin: 16px 0; }
+  #pc .xh { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--orca-muted); margin-bottom: 10px; }
+  #pc .pv .spool-card { margin: 0 0 14px; }
+  #pc .kv { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 0; font-size: 12.5px; border: 1px solid var(--orca-border); border-radius: 10px; overflow: hidden; margin: 0; }
+  #pc .kv > * { padding: 7px 12px; border-top: 1px solid var(--orca-border); margin: 0; overflow-wrap: anywhere; }
+  #pc .kv > :nth-child(-n+2) { border-top: 0; }
+  #pc .kv dt { color: var(--orca-muted); }
+  #pc .kv dd a { color: var(--orca-accent); cursor: pointer; float: right; font-size: 11.5px; margin-left: 8px; }
+  #pc .kv .o { color: var(--orca-muted); text-decoration: line-through; }
+  #pc .kv .nw { color: #f0b545; font-weight: 600; }
+  #pc .kv .fil { font-size: 10px; font-weight: 700; color: #f0b545; margin-left: 4px; }
+  #pc .bot { display: flex; align-items: center; gap: 8px; padding: 12px 18px; border-top: 1px solid var(--orca-border); }
+  #pc .bot .pg { color: var(--orca-muted); font-size: 12px; margin-right: auto; }
+  #pc .dots { display: inline-flex; gap: 5px; margin-left: 10px; vertical-align: middle; }
+  #pc .dots i { width: 7px; height: 7px; border-radius: 50%; background: var(--orca-border); }
+  #pc .dots i.on { background: var(--orca-accent); width: 18px; border-radius: 4px; }
+  #pc .sb { display: inline-flex; align-items: center; gap: 6px; background: transparent; color: var(--orca-fg); border: 1px solid var(--orca-border); border-radius: 6px; padding: 8px 16px; font-size: 12.5px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+  #pc .sb.pri { background: var(--orca-accent); color: var(--orca-accent-fg); border-color: var(--orca-accent); }
+  #pc .sb.amb { background: #e0a030; border-color: #e0a030; color: #1d1d1f; }
+  #pc .sb.ghost { border-color: transparent; color: var(--orca-muted); }
+  #pc .sb[disabled] { opacity: .45; cursor: default; }
+  #pc .ask { position: absolute; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; border-radius: 14px; }
+  #pc .ask .box { width: 360px; max-width: calc(100% - 32px); background: color-mix(in srgb, var(--orca-fg) 8%, var(--orca-bg)); border: 1px solid var(--orca-border); border-radius: 12px; padding: 16px 18px; }
+  #pc .ask h4 { margin: 0 0 6px; font-size: 15px; }
+  #pc .ask p { margin: 0 0 14px; color: color-mix(in srgb, var(--orca-fg) 80%, var(--orca-bg)); }
+  #pc .row { display: flex; justify-content: flex-end; gap: 8px; }
+  #pc .dcard { width: 440px; max-width: 100%; background: color-mix(in srgb, var(--orca-fg) 4%, var(--orca-bg)); border: 1px solid var(--orca-border); border-radius: 14px; padding: 18px 20px; color: var(--orca-fg); font-size: 13px; line-height: 1.45; box-shadow: 0 18px 50px rgba(0,0,0,.45); }
+  #pc .dh { display: flex; align-items: center; gap: 10px; font-size: 16px; font-weight: 700; margin-bottom: 14px; }
+  #pc .pulse { width: 10px; height: 10px; border-radius: 50%; background: #3fb950; box-shadow: 0 0 0 4px rgba(63,185,80,.2); }
+  #pc .dsp { display: flex; gap: 12px; align-items: center; padding: 10px 12px; border: 1px solid var(--orca-border); border-radius: 10px; }
+  #pc .dsp .d { width: 34px; height: 34px; border-radius: 50%; flex-shrink: 0; }
+  #pc .dsp small { display: block; color: var(--orca-muted); font-size: 11.5px; }
+  #pc .dcard p { margin: 12px 0; color: color-mix(in srgb, var(--orca-fg) 82%, var(--orca-bg)); }
+  #pc .dtag { display: flex; flex-direction: column; gap: 4px; padding: 9px 12px; border-radius: 8px; background: color-mix(in srgb, var(--orca-fg) 5%, transparent); margin-bottom: 16px; }
+  #pc .dtag span { font-size: 11px; color: var(--orca-muted); font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
+  #pc .dtag code { font-family: ui-monospace, Consolas, Menlo, "DejaVu Sans Mono", monospace !important; font-size: 12.5px; word-break: break-all; color: #4fd1c5; }
+  #pt { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); background: color-mix(in srgb, var(--orca-fg) 10%, var(--orca-bg)); border: 1px solid var(--orca-border); color: var(--orca-fg); border-radius: 8px; padding: 10px 16px; font-size: 13px; box-shadow: 0 6px 20px rgba(0,0,0,.35); z-index: 1001; }
+  #pt b { color: #3fb950; }
+  @media (max-width: 760px) {
+    #pc .mid { flex-direction: column; }
+    #pc .rail { width: auto; flex-direction: row; border-right: 0; border-bottom: 1px solid var(--orca-border); padding: 8px; overflow-x: auto; gap: 4px; }
+    #pc .st { width: auto; padding: 7px 9px; }
+    #pc .st small, #pc .mini { display: none; }
+    #pc .f3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    #pc .card { height: 100%; }
+  }
+"""
+
+# The Add Spool / Edit Spool card and the New Spool Detected pop-up.
+EDITOR_JS = r"""
+  var D = null, spools = [], canEdit = false, seen = {}, cat = { q: null, items: [], busy: false }, ct;
+  var mode, step, S, M, src, q, pick, unlock, ams, cur, ask, used, busy, err, auto, raw0;
+  var RF = '<div class="spool-rfid"><span>RFID</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="5" cy="19" r="1.8" fill="currentColor" stroke="none"></circle><path d="M5,14 A5,5 0 0 1 10,19"></path><path d="M5,10.5 A8.5,8.5 0 0 1 13.5,19"></path><path d="M5,7 A12,12 0 0 1 17,19"></path></svg></div>';
+  var esc = function (s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); };
+  var nv = function (a, b) { return a == null || a === "" ? (b == null ? "" : b) : a; };
+  var r1 = function (n) { return Math.round(n * 10) / 10; };
+  var g = function (n) { return (n === "" || n == null || isNaN(n)) ? "-" : r1(Number(n)).toLocaleString("en-GB") + " g"; };
+  var hex = function (c) { c = String(c || "").replace("#", ""); return /^[0-9a-fA-F]{6}/.test(c) ? c.slice(0, 6).toUpperCase() : ""; };
+  var dec = function (v) { if (typeof v !== "string") return v; try { return JSON.parse(v); } catch (e) { return v; } };
+  var plural = function (n, w) { return n + " " + w + (n === 1 ? "" : "s"); };
+  var STEPS = {
+    add: [["fil", "Filament", "🧵"], ["amt", "Amount", "⚖️"], ["sto", "Storage", "📍"], ["tag", "RFID & Extras", "🏷️"], ["rev", "Review", "✅"]],
+    edit: [["amt", "Amount", "⚖️"], ["sto", "Storage", "📍"], ["tag", "RFID & Extras", "🏷️"], ["fil", "Filament", "🧵"], ["rev", "Review", "✅"]]
+  };
+  document.body.insertAdjacentHTML("beforeend", '<div id="pc" hidden></div><div id="pt" hidden></div>');
+  var pc = document.getElementById("pc"), pt = document.getElementById("pt"), tt;
+  function toast(t) { clearTimeout(tt); pt.innerHTML = t; pt.hidden = false; tt = setTimeout(function () { pt.hidden = true; }, 4000); }
+  var fields = function () { return (D && D.fields || []).filter(function (f) { return f.key !== "tag"; }); };
+  function fils() {
+    if (D && D.filaments) return D.filaments;
+    var o = {}, a = [];
+    spools.forEach(function (s) {
+      var f = s.filament || {};
+      if (f.id == null || o[f.id]) return;
+      o[f.id] = 1;
+      a.push({ id: f.id, v: (f.vendor || {}).name || "", n: f.name || "", m: f.material || "", c: hex(f.color_hex), w: f.weight, sw: f.spool_weight, d: f.density, dia: f.diameter, e: f.settings_extruder_temp, b: f.settings_bed_temp });
+    });
+    return a;
+  }
+  var cnt = function (fid) { return spools.filter(function (s) { return (s.filament || {}).id === fid; }).length; };
+  function blank() {
+    return { fid: null, ext_id: "", name: "", vendor: "", material: "", color_hex: "", diameter: 1.75, density: 1.24, ext: "", bed: "",
+      initial_weight: 1000, spool_weight: 250, remaining_weight: 1000, location: "", lot_nr: "", price: "", comment: "", tag: "", extra: {} };
+  }
+  function fillX() {
+    fields().forEach(function (f) {
+      if (!(f.key in S.extra)) {
+        var v = dec((raw0 || {})[f.key]);
+        if (v == null) v = f.type === "boolean" ? false : "";
+        S.extra[f.key] = v;
+        if (M) M.extra[f.key] = v;
+      }
+    });
+  }
+  function fromFil(f, how) {
+    S.fid = how === "mine" ? f.id : null; S.ext_id = how === "cat" ? f.x : "";
+    S.name = f.n || ""; S.vendor = f.v || ""; S.material = f.m || ""; S.color_hex = hex(f.c);
+    S.diameter = nv(f.dia, 1.75); S.density = nv(f.d, 1.24); S.ext = nv(f.e); S.bed = nv(f.b);
+    S.initial_weight = nv(f.w, 1000); S.spool_weight = nv(f.sw, 250);
+    if (!used) S.remaining_weight = S.initial_weight;
+    if (ams) S.remaining_weight = ams.pct == null ? S.initial_weight : Math.round(S.initial_weight * ams.pct / 100);
+    pick = how + ":" + (how === "mine" ? f.id : how === "cat" ? f.x : f.n);
+  }
+  function load() { orca.postMessage({ type: "editor" }); }
+  function find(qq) { cat.busy = true; cat.q = qq; orca.postMessage({ type: "catalogue", q: qq }); }
+  function reset() { step = 0; ask = ""; busy = false; err = ""; auto = null; ams = null; q = ""; pick = ""; raw0 = {}; }
+  function openAdd() { reset(); mode = "add"; S = blank(); M = null; src = "mine"; unlock = true; used = false; cur = null; fillX(); load(); draw(); }
+  function openEdit(s) {
+    reset();
+    var f = s.filament || {};
+    mode = "edit"; cur = s.id; unlock = false; used = "rem"; raw0 = s.extra || {};
+    S = { fid: f.id, ext_id: "", name: f.name || "", vendor: (f.vendor || {}).name || "", material: f.material || "", color_hex: hex(f.color_hex),
+      diameter: nv(f.diameter), density: nv(f.density), ext: nv(f.settings_extruder_temp), bed: nv(f.settings_bed_temp),
+      initial_weight: nv(s.initial_weight, f.weight), spool_weight: nv(s.spool_weight, f.spool_weight), remaining_weight: nv(s.remaining_weight),
+      location: s.location || "", lot_nr: s.lot_nr || "", price: nv(s.price), comment: s.comment || "",
+      tag: String(nv(dec(raw0.tag))), extra: {} };
+    M = JSON.parse(JSON.stringify(S)); fillX(); load(); draw();
+  }
+  window.__spoolioEdit = function (s) { if (s) openEdit(s); else openAdd(); };
+  var LBL = { name: "Name", vendor: "Manufacturer", material: "Material", color_hex: "Colour", diameter: "Diameter", density: "Density", ext: "Nozzle Temp", bed: "Bed Temp",
+    initial_weight: "Filament Weight", spool_weight: "Empty Spool", remaining_weight: "Remaining", location: "Location", lot_nr: "Lot Number", price: "Price", comment: "Note", tag: "RFID Tag" };
+  var unit = function (k) { return { initial_weight: " g", spool_weight: " g", remaining_weight: " g", price: " " + (D ? D.cur : "€"), diameter: " mm", density: " g/cm³", ext: " °C", bed: " °C" }[k] || ""; };
+  var FILK = ["name", "vendor", "material", "color_hex", "diameter", "density", "ext", "bed"];
+  var SPK = ["remaining_weight", "initial_weight", "spool_weight", "location", "lot_nr", "price", "comment"];
+  var STEPK = { amt: ["remaining_weight", "initial_weight", "spool_weight"], sto: ["location", "lot_nr", "price", "comment"], tag: ["tag"], fil: FILK };
+  var same = function (a, b) { return JSON.stringify(a == null ? "" : a) === JSON.stringify(b == null ? "" : b) || String(a) === String(b); };
+  function fmt(k, v) {
+    if (v === "" || v == null || (Array.isArray(v) && !v.join(""))) return "Empty";
+    if (k === "color_hex") return "#" + String(v).toUpperCase();
+    if (typeof v === "boolean") return v ? "Yes" : "No";
+    if (Array.isArray(v)) return v.join(" - ");
+    return String(v) + unit(k);
+  }
+  function diffs() {
+    if (!M) return [];
+    var d = [];
+    Object.keys(LBL).forEach(function (k) { if (!same(S[k], M[k])) d.push({ k: k, l: LBL[k], o: fmt(k, M[k]), n: fmt(k, S[k]), fil: FILK.indexOf(k) >= 0 }); });
+    fields().forEach(function (f) { if (!same(S.extra[f.key], M.extra[f.key])) d.push({ k: "x:" + f.key, l: f.name, o: fmt("", M.extra[f.key]), n: fmt("", S.extra[f.key]) }); });
+    return d;
+  }
+  var chgStep = function (id) { var ks = STEPK[id] || []; return diffs().some(function (x) { return ks.indexOf(x.k) >= 0 || (id === "tag" && x.k.indexOf("x:") === 0); }); };
+  function sum(id) {
+    if (id === "fil") return S.name ? S.name : "Not Chosen Yet";
+    if (id === "amt") return g(S.remaining_weight) + " Left";
+    if (id === "sto") return S.location || "No Location";
+    if (id === "tag") return S.tag ? "Tag " + S.tag.slice(0, 8) + "…" : "No Tag";
+    if (id === "rev") return mode === "edit" ? (diffs().length ? diffs().length + " to Save" : "No Changes") : "Check and Add";
+  }
+  var ok = function (id) { return id !== "fil" || !!String(S.name).trim(); };
+  function inp(k, u, o) {
+    o = o || {};
+    var ch = M && !same(S[k], M[k]);
+    return '<div class="' + (ch ? "chg" : "") + '"' + (o.span ? ' style="grid-column:span ' + o.span + '"' : "") + '><label class="fl">' + (o.l || LBL[k]) + (o.rf ? RF : "") + '</label><div class="in"><input data-k="' + k + '" value="' + esc(k === "color_hex" ? String(S[k]).toUpperCase() : S[k]) + '"' +
+      (o.dis ? " disabled" : "") + (o.ph ? ' placeholder="' + o.ph + '"' : "") + (o.list ? ' list="' + o.list + '"' : "") + (o.cls ? ' class="' + o.cls + '"' : "") +
+      (u ? ' style="padding-right:' + (16 + u.length * 7) + 'px"' : "") + '>' + (u ? '<span class="u">' + u + '</span>' : "") + '</div></div>';
+  }
+  function card() {
+    var col = "#" + (S.color_hex || "555555"), rem = Number(S.remaining_weight), ini = Number(S.initial_weight) || 1, pct = Math.max(0, Math.min(100, Math.round(rem / ini * 100)));
+    return '<div class="spool-card">' + (S.vendor ? '<div class="spool-tag"><svg viewBox="0 0 12 12" fill="currentColor"><rect x="0" y="0" width="5" height="5" rx="1"></rect><rect x="7" y="0" width="5" height="5" rx="1"></rect><rect x="0" y="7" width="5" height="5" rx="1"></rect><rect x="7" y="7" width="5" height="5" rx="1"></rect></svg><span>' + esc(S.vendor) + '</span></div>' : "") +
+      '<div class="spool-body"><div class="spool-swatch-col"><div class="spool-swatch" style="background:' + col + '"></div>' + (S.tag ? RF : "") + '</div><div class="spool-main"><div class="spool-top"><div class="spool-title">' + esc(S.name || "New Spool") + '</div>' +
+      '<div class="spool-weight"><span class="spool-pct">' + pct + '% ·</span>' + g(rem) + '</div></div>' +
+      '<div class="spool-bar-track"><div class="spool-bar-fill" style="width:' + pct + '%;background:' + col + '"></div></div>' +
+      '<div class="spool-subtitle"><span class="sub-text">' + esc(S.material || "-") + ' · ' + col.toUpperCase() + ' · ' + esc(S.diameter) + 'mm' + (S.location ? ' · ' + esc(S.location) : "") + '</span></div></div></div></div>';
+  }
+  var amsTxt = function () { return esc(ams.printer + " · " + ams.where); };
+  function pFil() {
+    if (mode === "edit") {
+      var n = cnt(S.fid);
+      return '<div class="note' + (unlock ? " amb" : "") + ' lock" style="margin:0 0 14px">' + (unlock ? "⚠️ Applies to " + plural(n, "Spool") + "." :
+        "🔒 Shared Filament Fields.") + (unlock ? "" : '<button class="sb" data-a="unlock">Edit Filament</button>') + '</div>' + filForm(!unlock);
+    }
+    var h = ams ? '<div class="ams"><span class="d" style="background:#' + (ams.c || "555555") + '"></span><span><b>✓ Filled In From ' + amsTxt() + '</b></span></div>' : "";
+    h += '<div class="seg">' + [["mine", "My Filaments"], ["cat", "Spoolman Catalogue"], ["new", "New Filament"]].map(function (x) { return '<button data-src="' + x[0] + '" class="' + (src === x[0] ? "on" : "") + '">' + x[1] + '</button>'; }).join("") + '</div>';
+    if (src === "new") return h + filForm(false);
+    var rows, empty = "Nothing Matches. Try the Catalogue or Add a New Filament.";
+    if (src === "mine") {
+      rows = fils().map(function (f) { var c = cnt(f.id); return { k: "mine:" + f.id, c: f.c, n: f.n, s: [f.v, f.m, plural(c, "Spool")].filter(Boolean).join(" · "), f: f }; });
+      rows = rows.filter(function (r) { return !q || (r.n + " " + r.s).toLowerCase().indexOf(q.toLowerCase()) >= 0; });
+    } else {
+      if (cat.q !== q && !cat.busy) find(q);
+      rows = cat.items.map(function (f) { return { k: "cat:" + f.x, c: f.c, n: f.n, s: [f.v, f.m, f.w ? f.w + " g" + (f.sw ? " on a " + f.sw + " g Spool" : "") : ""].filter(Boolean).join(" · "), f: f }; });
+      if (cat.busy) empty = "Searching…"; else if (cat.err) empty = esc(cat.err);
+    }
+    h += '<div class="in srch"><input data-q="1" value="' + esc(q) + '" placeholder="' + (src === "mine" ? "Search Your Filaments" : "Search the Catalogue, e.g. Polymaker PLA") + '"></div>';
+    h += '<div class="ls">' + (rows.length ? rows.map(function (r, i) { return '<div class="li' + (pick === r.k ? " on" : "") + '" data-pick="' + i + '"><span class="d" style="background:#' + (r.c || "555555") + '"></span><span>' + esc(r.n) + '<small>' + esc(r.s) + '</small></span><i>' + (pick === r.k ? "Selected" : "Choose") + '</i></div>'; }).join("") : '<div class="li"><span>' + empty + '</span></div>') + '</div>';
+    if (src === "cat" && cat.more) h += '<div class="note">Showing the First 60. Type More to Narrow It Down.</div>';
+    pFil.rows = rows;
+    return h;
+  }
+  function filForm(dis) {
+    var col = "#" + (S.color_hex || "555555");
+    return '<div class="f3">' + inp("name", "", { dis: dis, span: 2, ph: "e.g. PLA Matte - Black" }) +
+      inp("vendor", "", { dis: dis, list: "pc-vend", ph: "Pick or Type a New One" }) +
+      inp("material", "", { dis: dis, list: "pc-mats", ph: "PLA" }) +
+      '<div class="' + (M && !same(S.color_hex, M.color_hex) ? "chg" : "") + '"><label class="fl">Colour</label><div class="col"><span class="sw" style="background:' + col + '"></span><div class="in" style="flex:1"><input data-k="color_hex" value="' + esc(String(S.color_hex).toUpperCase()) + '"' + (dis ? " disabled" : "") + ' placeholder="000000"></div></div></div>' +
+      inp("diameter", "mm", { dis: dis }) + inp("density", "g/cm³", { dis: dis }) + inp("ext", "°C", { dis: dis }) + inp("bed", "°C", { dis: dis }) + '</div>' +
+      '<datalist id="pc-vend">' + (D ? D.vendors : []).map(function (v) { return '<option value="' + esc(v) + '">'; }).join("") + '</datalist><datalist id="pc-mats"><option value="PLA"><option value="PETG"><option value="ABS"><option value="ASA"><option value="TPU"><option value="PA"><option value="PC"></datalist>';
+  }
+  function pAmt() {
+    var rem = Number(S.remaining_weight), ini = Number(S.initial_weight), col = "#" + (S.color_hex || "555555"), h = "";
+    var opts = mode === "add" ? [[false, "New and Sealed"], [true, "Already Used"]] : [["rem", "Grams Left"], ["use", "Grams Used"]];
+    h += '<div class="seg">' + opts.map(function (x) { return '<button data-used="' + x[0] + '" class="' + (used === x[0] ? "on" : "") + '">' + x[1] + '</button>'; }).join("") + '</div>';
+    var main = used === "use" ? '<div class="' + (!same(S.remaining_weight, M.remaining_weight) ? "chg" : "") + '"><label class="fl">Used</label><div class="in"><input data-k="usedg" value="' + r1(ini - rem) + '" style="padding-right:24px"><span class="u">g</span></div></div>'
+      : (mode === "add" && !used) ? '<div><label class="fl">Remaining</label><div class="in"><input value="' + esc(S.initial_weight) + '" disabled style="padding-right:24px"><span class="u">g</span></div></div>'
+      : inp("remaining_weight", "g");
+    h += '<div class="f3">' + main + inp("initial_weight", "g", { l: "Filament Weight" }) + inp("spool_weight", "g", { l: "Empty Spool Weight" }) + '</div>';
+    h += '<div class="meter"><i style="width:' + Math.max(0, Math.min(100, rem / (ini || 1) * 100)) + '%;background:' + col + '"></i></div><div class="calc"><b>' + g(rem) + '</b> Left of ' + g(ini) + ' · ' + g(ini - rem) + ' Used</div>';
+    return h;
+  }
+  function pSto() {
+    var locs = []; spools.forEach(function (x) { if (x.location && locs.indexOf(x.location) < 0) locs.push(x.location); });
+    return '<div class="f3">' + inp("location", "", { list: "pc-locs", ph: "e.g. Shelf" }) + inp("lot_nr", "", { ph: "Optional" }) + inp("price", (D ? D.cur : "€"), { ph: "Optional" }) + '</div>' +
+      '<datalist id="pc-locs">' + locs.map(function (l) { return '<option value="' + esc(l) + '">'; }).join("") + '</datalist>' +
+      '<div style="margin-top:14px" class="' + (M && !same(S.comment, M.comment) ? "chg" : "") + '"><label class="fl">Note</label><textarea data-k="comment" placeholder="Optional">' + esc(S.comment) + '</textarea></div>';
+  }
+  function xf(f) {
+    var val = S.extra[f.key], c = M && !same(val, M.extra[f.key]) ? "chg" : "", lb = '<label class="fl">' + esc(f.name) + '</label>';
+    if (f.type === "boolean") return '<div class="' + c + '">' + lb + '<div class="tg" data-xb="' + esc(f.key) + '"><div class="tog' + (val ? " on" : "") + '"></div><span>' + (val ? "Yes" : "No") + '</span></div></div>';
+    if (f.type === "choice" && !f.multi) return '<div class="' + c + '">' + lb + '<div class="in"><select data-x="' + esc(f.key) + '"><option value="">None</option>' + f.choices.map(function (o) { return '<option' + (o === val ? " selected" : "") + '>' + esc(o) + '</option>'; }).join("") + '</select></div></div>';
+    var shown = Array.isArray(val) ? val.join(f.type.indexOf("range") > 0 ? " - " : ", ") : val;
+    var ph = f.type.indexOf("range") > 0 ? "Min - Max" : f.multi ? f.choices.join(", ") : f.type === "datetime" ? "YYYY-MM-DD HH:MM" : "";
+    return '<div class="' + c + '">' + lb + '<div class="in"><input data-x="' + esc(f.key) + '" value="' + esc(shown) + '" placeholder="' + esc(ph) + '"' + (f.unit ? ' style="padding-right:' + (16 + f.unit.length * 7) + 'px"' : "") + '>' + (f.unit ? '<span class="u">' + esc(f.unit) + '</span>' : "") + '</div></div>';
+  }
+  function xval(f, t) {
+    if (f.type === "integer" || f.type === "float") { var n = parseFloat(t.replace(",", ".")); return t.trim() === "" ? "" : isNaN(n) ? t : (f.type === "integer" ? Math.round(n) : n); }
+    if (f.type.indexOf("range") > 0) { var p = t.split(/\s+-\s+|\s*[–,;]\s*/).map(function (x) { var n = parseFloat(x); return isNaN(n) ? "" : n; }); return t.trim() === "" ? "" : [nv(p[0]), nv(p[1])]; }
+    if (f.multi) return t.trim() === "" ? "" : t.split(",").map(function (x) { return x.trim(); }).filter(Boolean);
+    return t;
+  }
+  function pTag() {
+    var xs = fields();
+    return '<div class="f2">' + inp("tag", "", { l: " ", rf: 1, cls: "mono", span: 2, ph: "Empty if the Spool Has No Tag" }) + '</div>' +
+      (mode === "add" && ams ? '<div class="note">Read From ' + amsTxt() + '.</div>' : "") +
+      '<div class="sep"></div><div class="xh">Your Spoolman Extra Fields</div>' +
+      (!D ? '<div class="note">Loading…</div>' : xs.length ? '<div class="f2">' + xs.map(xf).join("") + '</div>' : '<div class="note">No Extra Fields Set Up in Spoolman.</div>');
+  }
+  function pRev() {
+    var h = '<div class="pv">' + card() + '</div>';
+    if (mode === "edit") {
+      var d = diffs();
+      if (!d.length) return h + '<div class="note">No Changes Yet.</div>';
+      return h + '<dl class="kv">' + d.map(function (x) { return '<dt>' + esc(x.l) + (x.fil ? '<span class="fil">Filament</span>' : "") + '</dt><dd><span class="o">' + esc(x.o) + '</span> → <span class="nw">' + esc(x.n) + '</span></dd>'; }).join("") + '</dl>';
+    }
+    var newf = pick.indexOf("mine:") !== 0, c = D ? D.cur : "€";
+    var rows = [["Filament", (S.name || "Not Chosen") + (newf && S.name ? " (New in Spoolman)" : ""), 0], ["Manufacturer", S.vendor || "-", 0], ["Remaining", g(S.remaining_weight) + " of " + g(S.initial_weight), 1],
+      ["Empty Spool", g(S.spool_weight), 1], ["Location", S.location || "-", 2], ["Lot / Price", (S.lot_nr || "-") + " · " + (S.price !== "" ? S.price + " " + c : "-"), 2], ["RFID Tag", S.tag || "None", 3]];
+    return h + '<dl class="kv">' + rows.map(function (r) { return '<dt>' + r[0] + '</dt><dd>' + esc(r[1]) + '<a data-go="' + r[2] + '">Change</a></dd>'; }).join("") + '</dl>';
+  }
+  function draw() {
+    var st = STEPS[mode], id = st[step][0], d = diffs(), n = d.length;
+    var pages = { fil: pFil, amt: pAmt, sto: pSto, tag: pTag, rev: pRev };
+    var lead = { fil: mode === "add" ? "Choose an Existing Filament or Create a New Filament." : "Shared by Every Spool of This Filament.",
+      amt: "How Much Is on the Spool.", sto: "Where It's Kept.", tag: "Tag and Your Spoolman Fields.",
+      rev: mode === "add" ? "Check, Then Add." : "Your Changes." };
+    var last = step === st.length - 1, nc = "Save " + n + (n === 1 ? " Change" : " Changes");
+    var main = last ? (mode === "add" ? '<button class="sb pri" data-a="save"' + (S.name && !busy ? "" : " disabled") + '>' + (busy ? "Adding…" : "Add Spool to Spoolman") + '</button>'
+        : '<button class="sb pri" data-a="save"' + (n && !busy ? "" : " disabled") + '>' + (busy ? "Saving…" : n ? nc : "Save Changes") + '</button>')
+      : '<button class="sb pri" data-a="next"' + (ok(id) ? "" : " disabled") + '>Next: ' + st[step + 1][1] + ' ›</button>';
+    var quick = mode === "edit" && !last && n ? '<button class="sb" data-a="save"' + (busy ? " disabled" : "") + '>' + (busy ? "Saving…" : nc) + '</button>' : "";
+    var top = pc.querySelector(".body"), y = top ? top.scrollTop : 0, same0 = pc.dataset.at === mode + step;
+    pc.innerHTML = '<div class="card">' +
+      '<div class="top"><h2>' + (mode === "add" ? "Add Spool" : esc(M.name || "Spool") + '<span>Spool #' + esc(cur) + '</span>') + '</h2><button class="x" data-a="close" title="Close">×</button></div>' +
+      '<div class="mid"><nav class="rail">' + st.map(function (x, i) {
+        var cls = (i === step ? " on" : "") + (mode === "edit" && chgStep(x[0]) ? " chg" : (i < step && ok(x[0]) ? " done" : ""));
+        return '<button class="st' + cls + '" data-go="' + i + '"><span class="n">' + (cls.indexOf("done") >= 0 ? "✓" : i + 1) + '</span><span><b>' + x[1] + '</b><small>' + esc(sum(x[0])) + '</small></span></button>';
+      }).join("") +
+      '<div class="mini"><span class="d" style="background:#' + (S.color_hex || "555555") + '"></span><span><b>' + esc(S.name || "New Spool") + '</b><span>' + g(S.remaining_weight) + (S.location ? " · " + esc(S.location) : "") + '</span></span></div></nav>' +
+      '<div class="body"><h3><span class="emoji">' + st[step][2] + '</span>' + st[step][1] + '</h3><p class="lead">' + lead[id] + '</p>' +
+      (err ? '<div class="note bad" style="margin:0 0 14px">' + esc(err) + '</div>' : "") + pages[id]() + '</div></div>' +
+      '<div class="bot"><span class="pg">Step ' + (step + 1) + ' of ' + st.length + '<span class="dots">' + st.map(function (x, i) { return '<i class="' + (i === step ? "on" : "") + '"></i>'; }).join("") + '</span></span>' +
+      (step ? '<button class="sb" data-a="back">‹ Back</button>' : '<button class="sb ghost" data-a="close">Cancel</button>') + quick + main + '</div>' +
+      (ask ? '<div class="ask"><div class="box">' + ask + '</div></div>' : "") + '</div>';
+    pc.dataset.at = mode + step;
+    if (same0) pc.querySelector(".body").scrollTop = y;
+    pc.hidden = false;
+  }
+  function num(x) { var n = parseFloat(String(x).replace(",", ".")); return isNaN(n) ? x : n; }
+  var NUM = ["initial_weight", "spool_weight", "remaining_weight", "price", "diameter", "density", "ext", "bed"];
+  function keep(fn) {
+    var a = document.activeElement, sel = null, pos = a && a.selectionStart;
+    if (a && a.dataset) { if (a.dataset.k) sel = '[data-k="' + a.dataset.k + '"]'; else if (a.dataset.x) sel = '[data-x="' + a.dataset.x + '"]'; else if (a.dataset.q) sel = '[data-q="1"]'; }
+    fn(); draw();
+    if (sel) { var b = pc.querySelector(sel); if (b) { b.focus(); try { b.setSelectionRange(pos, pos); } catch (e) {} } }
+  }
+  pc.addEventListener("input", function (e) {
+    var t = e.target, d = t.dataset;
+    if (t.tagName === "SELECT") return;
+    keep(function () {
+      if (d.k === "usedg") S.remaining_weight = r1(Number(S.initial_weight) - num(t.value));
+      else if (d.k) {
+        S[d.k] = NUM.indexOf(d.k) >= 0 && t.value !== "" ? num(t.value) : (d.k === "color_hex" ? t.value.replace("#", "").toUpperCase() : t.value);
+        if (d.k === "initial_weight" && mode === "add" && !used) S.remaining_weight = S.initial_weight;
+        if (mode === "add" && FILK.indexOf(d.k) >= 0 && src === "new") { pick = "new"; S.fid = null; S.ext_id = ""; }
+      }
+      if (d.x) { var f = fields().filter(function (x) { return x.key === d.x; })[0]; if (f) S.extra[d.x] = xval(f, t.value); }
+      if (d.q) { q = t.value; if (src === "cat") { clearTimeout(ct); ct = setTimeout(function () { find(q); draw(); }, 350); } }
+    });
+  });
+  pc.addEventListener("change", function (e) { var d = e.target.dataset; if (d.x && e.target.tagName === "SELECT") { S.extra[d.x] = e.target.value; draw(); } });
+  function done() { pc.hidden = true; pc.innerHTML = ""; ask = ""; cur = null; mode = null; }
+  function close() {
+    if (busy) return;
+    var n = diffs().length, dirty = mode === "edit" ? n : (S.name || S.location || S.tag);
+    if (!dirty) return done();
+    ask = '<h4>' + (mode === "edit" ? "Discard " + n + (n === 1 ? " Change" : " Changes") + "?" : "Discard This Spool?") + '</h4><p>' + (mode === "edit" ? "Your Edits to " + esc(M.name) + " Haven't Been Saved to Spoolman." : "The Spool Hasn't Been Added to Spoolman Yet.") +
+      '</p><div class="row"><button class="sb" data-a="stay">Keep Editing</button><button class="sb amb" data-a="drop">Discard</button></div>'; draw();
+  }
+  function save() {
+    if (busy) return;
+    var msg = { type: "spool_save", id: mode === "edit" ? cur : null, fid: S.fid, spool: {}, fil: {}, extra: {} };
+    if (mode === "edit") {
+      diffs().forEach(function (x) {
+        if (SPK.indexOf(x.k) >= 0) msg.spool[x.k] = S[x.k];
+        else if (FILK.indexOf(x.k) >= 0) msg.fil[x.k] = S[x.k];
+        else if (x.k === "tag") msg.extra.tag = S.tag.trim();
+        else msg.extra[x.k.slice(2)] = S.extra[x.k.slice(2)];
+      });
+    } else {
+      if (pick.indexOf("mine:") !== 0) {
+        msg.fid = null;
+        FILK.forEach(function (k) { msg.fil[k] = S[k]; });
+        msg.fil.weight = S.initial_weight; msg.fil.spool_weight = S.spool_weight;
+        if (S.ext_id) msg.fil.external_id = S.ext_id;
+      }
+      SPK.forEach(function (k) { msg.spool[k] = k === "remaining_weight" && !used ? S.initial_weight : S[k]; });
+      fields().forEach(function (f) { var v = S.extra[f.key]; if (v !== "" && v !== false && v != null) msg.extra[f.key] = v; });
+      if (S.tag.trim()) msg.extra.tag = S.tag.trim();
+    }
+    busy = true; err = ""; draw();
+    orca.postMessage(msg);
+  }
+  function saved(r) {
+    if (!busy) return;
+    busy = false;
+    if (!r.ok) { err = r.error || "Spoolman Didn't Accept It."; draw(); return; }
+    var n = diffs().length, nm = S.name;
+    done();
+    if (r.added) toast('<b>✓</b> Added Spool #' + esc(r.id) + ', ' + esc(nm) + ', to Spoolman' + (r.made ? " (New Filament Created)" : "") + '.');
+    else toast('<b>✓</b> Saved ' + n + (n === 1 ? " Change" : " Changes") + ' to Spoolman.');
+  }
+  function prefill(n) {
+    ams = n; used = n.pct != null && n.pct < 100;
+    S.name = n.name; S.vendor = "Bambu Lab"; S.material = n.m; S.color_hex = n.c; S.diameter = n.dia; S.ext = nv(n.e); S.bed = nv(n.b);
+    S.initial_weight = n.w; S.spool_weight = 250; S.remaining_weight = n.pct == null ? n.w : Math.round(n.w * n.pct / 100);
+    S.tag = n.uid; S.location = n.printer + (n.unit ? " " + n.unit : "");
+    var mine = fils().filter(function (f) { return /bambu/i.test(f.v) && f.m === n.m && f.c === n.c; })[0];
+    if (mine) { src = "mine"; fromFil(mine, "mine"); }
+    else { src = "cat"; q = "Bambu " + n.name; auto = n.c; pick = "new"; find(q); }
+  }
+  function det(n) {
+    seen[n.uid] = 1;
+    pc.innerHTML = '<div class="dcard"><div class="dh"><span class="pulse"></span>New Spool Detected</div>' +
+      '<div class="dsp"><span class="d" style="background:#' + (n.c || "555555") + '"></span><span><b>Bambu Lab ' + esc(n.name) + '</b><small>' + esc(n.printer + " · " + n.where + " · " + n.m) + (n.pct != null ? " · " + n.pct + "% Left" : "") + '</small></span></div>' +
+      '<p>Not in Spoolman Yet. Add It?</p>' +
+      '<div class="dtag"><span>RFID Tag</span><code>' + esc(n.uid) + '</code></div>' +
+      '<div class="row"><button class="sb ghost" data-a="det-later">Not Now</button><button class="sb pri" data-a="det-add">Add to Spoolman</button></div></div>';
+    pc.det = n; mode = null; pc.dataset.at = ""; pc.hidden = false;
+  }
+  pc.addEventListener("click", function (e) {
+    if (e.target === pc) { if (!mode) { pc.hidden = true; return; } return close(); }
+    var t = e.target.closest("[data-a],[data-go],[data-src],[data-pick],[data-used],[data-xb]"); if (!t) return;
+    var d = t.dataset;
+    if (d.go != null) { step = +d.go; ask = ""; draw(); pc.querySelector(".body").scrollTop = 0; return; }
+    if (d.src) { src = d.src; q = ""; draw(); return; }
+    if (d.pick != null) { var r = pFil.rows[+d.pick]; if (r) { fromFil(r.f, src); draw(); } return; }
+    if (d.used != null) {
+      used = d.used === "true" ? true : d.used === "false" ? false : d.used;
+      if (mode === "add" && !used) S.remaining_weight = S.initial_weight;
+      draw(); return;
+    }
+    if (d.xb) { S.extra[d.xb] = !S.extra[d.xb]; draw(); return; }
+    var a = d.a;
+    if (a === "next") { step++; draw(); pc.querySelector(".body").scrollTop = 0; }
+    if (a === "back") { step--; draw(); }
+    if (a === "close") close();
+    if (a === "stay") { ask = ""; draw(); }
+    if (a === "drop") done();
+    if (a === "save") save();
+    if (a === "unlock") { unlock = true; draw(); }
+    if (a === "det-later") { orca.postMessage({ type: "new_skip", uid: pc.det.uid }); pc.hidden = true; toast("Won't Ask Again for This Spool."); }
+    if (a === "det-add") { var n = pc.det; openAdd(); prefill(n); draw(); }
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key !== "Escape" || pc.hidden) return;
+    if (!mode) pc.hidden = true; else if (ask) { ask = ""; draw(); } else close();
+  });
+  orca.onMessage(function (m) {
+    if (!m) return;
+    if (m.type === "spools" && m.ok) {
+      spools = m.spools || [];
+      if (m.can_edit && !canEdit && !D) load();
+      canEdit = m.can_edit === true;
+    } else if (m.type === "editor") {
+      if (m.ok) D = m;
+      if (mode) { fillX(); draw(); }
+    } else if (m.type === "catalogue") {
+      if (m.q !== cat.q) return;
+      cat.busy = false; cat.items = m.items || []; cat.more = !!m.more; cat.err = m.ok ? "" : m.error;
+      if (auto && mode === "add") {
+        var hit = cat.items.filter(function (f) { return /bambu/i.test(f.v) && f.c === auto; })[0];
+        auto = null;
+        if (hit) fromFil(hit, "cat"); else src = "new";
+      }
+      if (mode === "add") draw();
+    } else if (m.type === "spool_saved") {
+      saved(m);
+    } else if (m.type === "live" && canEdit && Array.isArray(m["new"]) && pc.hidden) {
+      var n = m["new"].filter(function (x) { return !seen[x.uid]; })[0];
+      if (n && !document.getElementById("view-main").classList.contains("view-hidden")) det(n);
+    }
+  });
+"""
+
+
+EMOJI = '"Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji"'
+LOOK_FONTS = [
+    ("def", "Default", "Spoolio's current font", "Roboto · Segoe UI · San Francisco · Noto Sans", FONT_STACK),
+    ("sans", "Classic Sans", "Plain and familiar", "Arial · Helvetica · Liberation Sans",
+     f'Arial, Helvetica, "Liberation Sans", "Nimbus Sans", {EMOJI}, sans-serif'),
+    ("wide", "Easy Read", "Wider letters, made for screens", "Verdana · DejaVu Sans",
+     f'Verdana, "DejaVu Sans", "Bitstream Vera Sans", {EMOJI}, sans-serif'),
+    ("serif", "Serif", "Book-style letters", "Georgia · Times New Roman · DejaVu Serif",
+     f'Georgia, "Times New Roman", "DejaVu Serif", "Liberation Serif", {EMOJI}, serif'),
+    ("mono", "Monospace", "Every letter the same width", "Consolas · Menlo · DejaVu Sans Mono",
+     f'Consolas, Menlo, "DejaVu Sans Mono", "Liberation Mono", {EMOJI}, monospace'),
+]
+LOOK_SIZES = [(90, "Small"), (100, "Default"), (115, "Large"), (130, "Extra Large")]
+
+LOOK_CSS = """
+  html.apf * { font-family: var(--apf) !important; }
+  #view-settings .ap-pane { display: none; }
+  #view-settings.ap-on > .srow { display: none; }
+  #view-settings.ap-on > .ap-pane { display: block; }
+  #view-settings .fo-list { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+  #view-settings .fo { display: flex; align-items: center; gap: 14px; padding: 10px 14px; border: 1px solid var(--orca-border); border-radius: 10px; cursor: pointer; background: color-mix(in srgb, var(--orca-fg) 2%, var(--orca-bg) 98%); }
+  #view-settings .fo:hover { border-color: color-mix(in srgb, var(--orca-accent) 50%, var(--orca-border) 50%); }
+  #view-settings .fo.on { border-color: var(--orca-accent); background: color-mix(in srgb, var(--orca-accent) 12%, var(--orca-bg) 88%); box-shadow: 0 0 0 1px var(--orca-accent); }
+  #view-settings .fo-aa { width: 44px; text-align: center; font-size: 24px; font-weight: 700; flex: none; }
+  #view-settings .fo-t { min-width: 0; flex: 1; }
+  #view-settings .fo-n { font-weight: 700; font-size: 14px; }
+  #view-settings .fo-s { font-size: 12px; color: var(--orca-muted); margin-top: 1px; }
+  #view-settings .fo-w { font-size: 11px; color: var(--orca-muted); margin-top: 3px; opacity: .85; }
+  #view-settings .fo-ck { width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--orca-border); flex: none; box-sizing: border-box; }
+  #view-settings .fo.on .fo-ck { border: 5px solid var(--orca-accent); background: var(--orca-accent-fg); }
+  #view-settings .ap-prev { padding: 14px 16px; border: 1px solid var(--orca-border); border-radius: 10px; background: color-mix(in srgb, var(--orca-fg) 5%, var(--orca-bg) 95%); }
+  #view-settings .ap-prev + .ap-prev, #view-settings .ws-card + .ap-prev { margin-top: 10px; }
+  #view-settings .ap-h { font-size: 15px; font-weight: 700; }
+  #view-settings .ap-nums { display: flex; justify-content: space-between; font-size: 13px; color: var(--orca-muted); }
+  #view-settings .ap-nums b { color: var(--orca-fg); font-size: 18px; }
+  #view-settings .ap-bar { height: 6px; border-radius: 3px; background: var(--orca-border); margin: 8px 0 6px; overflow: hidden; }
+  #view-settings .ap-bar i { display: block; height: 100%; width: 37%; background: var(--orca-accent); }
+  #view-settings .ap-note { display: flex; gap: 8px; align-items: flex-start; margin-top: 12px; padding: 9px 12px; border-radius: 8px; font-size: 12px; color: var(--orca-muted); background: color-mix(in srgb, var(--orca-accent) 9%, var(--orca-bg) 91%); }
+  #view-settings .ap-note b { color: var(--orca-fg); }
+  #view-settings .ap-reset { background: none; border: 0; padding: 0; color: var(--orca-accent); cursor: pointer; text-decoration: underline; font-size: 12px; }
+  #view-settings .sz-row { display: flex; align-items: flex-end; gap: 18px; margin-top: 4px; }
+  #view-settings .sz-row span { color: var(--orca-muted); font-size: 12px; text-align: center; }
+  #view-settings .sz-row span.on { color: var(--orca-accent); font-weight: 700; }
+  #view-settings .sz-row span i { display: block; font-style: normal; font-weight: 700; color: var(--orca-fg); line-height: 1.1; margin-bottom: 4px; }
+  #view-settings .sz-row span.on i { color: var(--orca-accent); }
+  :root { --sp-card: color-mix(in srgb, var(--orca-fg) 5%, var(--orca-bg) 95%); --sp-rad: 14px; --sp-sw: 42px; }
+  html.th body { background: var(--orca-bg); color: var(--orca-fg); }
+  html.th #view-main .spool-card, html.th #view-settings .srow, html.th #view-settings .ws-card, html.th #view-settings .ap-prev, html.th #view-settings .preview, html.th #view-main .group-card, html.th #view-main .pp-card, html.th #view-main .st-card { background: var(--sp-card) !important; }
+  html.lt #view-main .spool-swatch, html.lt .tp-sw { border-color: rgba(0,0,0,.14) !important; }
+  html.lt #view-main .spool-tag { box-shadow: 0 1px 2px rgba(0,0,0,.18); }
+  #view-main .spool-card { border-radius: var(--sp-rad); }
+  #view-settings .srow { border-radius: min(var(--sp-rad), 14px); }
+  #view-main #list .spool-swatch { width: var(--sp-sw); height: var(--sp-sw); }
+  html.dn-c #view-main .spool-card { padding: 9px 11px 7px; margin-bottom: 6px; }
+  html.dn-c #view-main .spool-title { font-size: 13px; }
+  html.dn-c #view-main .spool-bar-track { margin: 4px 0 3px; height: 4px; }
+  html.dn-c #view-main .spool-body { gap: 9px; }
+  html.dn-c #view-main #list.cols-2 .spool-card { height: calc(100% - 6px); }
+  html.dn-s #view-main .spool-card { padding: 18px 18px 15px; margin-bottom: 14px; }
+  html.dn-s #view-main .spool-title { font-size: 15px; }
+  html.dn-s #view-main .spool-bar-track { margin: 9px 0 7px; height: 7px; }
+  html.dn-s #view-main .spool-body { gap: 14px; }
+  html.dn-s #view-main #list.cols-2 .spool-card { height: calc(100% - 14px); }
+  html.sw-spool #view-main #list .spool-swatch, .tp-sw.spool { background-image: radial-gradient(circle, var(--sp-card) 0 19%, rgba(0,0,0,.4) 20% 25%, rgba(255,255,255,.12) 26% 30%, transparent 31% 60%, rgba(0,0,0,.16) 61% 64%, transparent 65%) !important; }
+  html.sw-square #view-main #list .spool-swatch, .tp-sw.square { border-radius: 22% !important; }
+  html.sw-pill #view-main #list .spool-swatch, .tp-sw.pill { width: 10px !important; border-radius: 5px !important; margin: 0 13px; }
+  html.hd-tag #view-main #list .spool-tag, html.hd-rfid #view-main #list .spool-rfid, html.hd-cart #view-main #list .spool-cart { display: none !important; }
+  html.rm *, html.rm *::before, html.rm *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
+  html.cb #view-main .spool-weight.low { color: #e69f00 !important; }
+  html.cb #view-main .spool-weight.low::before { content: "▼"; font-size: 9px; margin-right: -2px; }
+  html.cb #view-main .live-dot, html.cb .tp-ok i { background: #56b4e9 !important; }
+  html.cb #view-main .plate-pill.fine, html.cb .tp-chip.ok { background: rgba(86,180,233,.2) !important; color: #56b4e9 !important; }
+  html.cb #view-main .group-card .group-bar-fill.low { background: #d55e00 !important; }
+  html.cb .tp-chip.bad { background: rgba(213,94,0,.2) !important; color: #e8792b !important; }
+  html.cb .tp-chip.warn { background: rgba(230,159,0,.2) !important; color: #e69f00 !important; }
+  html.cb .tp-chip.bad::before { content: "▼ "; } html.cb .tp-chip.warn::before { content: "▲ "; } html.cb .tp-chip.ok::before { content: "● "; }
+  #view-settings > .srow.moved { display: none !important; }
+  #view-settings .th-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 12px 18px 6px; }
+  #view-settings .th { cursor: pointer; border: 1px solid var(--orca-border); border-radius: 12px; padding: 8px; background: var(--orca-bg); }
+  #view-settings .th:hover { border-color: color-mix(in srgb, var(--orca-accent) 55%, var(--orca-border)); }
+  #view-settings .th.on { border-color: var(--orca-accent); box-shadow: 0 0 0 1px var(--orca-accent); }
+  #view-settings .th-m { height: 92px; border-radius: 8px; overflow: hidden; position: relative; border: 1px solid rgba(127,127,127,.25); }
+  #view-settings .th-m .bar { height: 14px; display: flex; gap: 4px; align-items: center; padding: 0 6px; }
+  #view-settings .th-m .bar i { width: 18px; height: 6px; border-radius: 3px; }
+  #view-settings .th-m .cd { margin: 6px 8px 0; height: 24px; border-radius: 6px; display: flex; align-items: center; gap: 6px; padding: 0 6px; border: 1px solid; }
+  #view-settings .th-m .cd b { width: 12px; height: 12px; border-radius: 50%; flex: none; }
+  #view-settings .th-m .cd s { flex: 1; height: 4px; border-radius: 2px; text-decoration: none; }
+  #view-settings .th-f { display: flex; align-items: center; gap: 8px; margin-top: 8px; padding: 0 2px; }
+  #view-settings .th-n { font-weight: 700; font-size: 13px; flex: 1; }
+  #view-settings .th-s { font-size: 11px; color: var(--orca-muted); padding: 2px; min-height: 28px; }
+  #view-settings .th .fo-ck { width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--orca-border); box-sizing: border-box; flex: none; }
+  #view-settings .th.on .fo-ck { border: 5px solid var(--orca-accent); background: var(--orca-accent-fg); }
+  #view-settings .th-pane .hint { padding: 0 18px 16px; margin: 0; }
+  #view-settings .tb-from { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 14px; }
+  #view-settings .tb-from button { padding: 5px 10px 5px 6px; border: 1px solid var(--orca-border); border-radius: 99px; font-size: 12px; display: inline-flex; align-items: center; gap: 6px; font-weight: 600; background: transparent; color: var(--orca-fg); cursor: pointer; }
+  #view-settings .tb-from button:hover { border-color: var(--orca-accent); }
+  #view-settings .tb-from button i { width: 14px; height: 14px; border-radius: 50%; display: inline-block; border: 3px solid; box-sizing: border-box; }
+  #view-settings .tb-cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px 14px; }
+  #view-settings .tb-c { display: flex; align-items: center; gap: 10px; padding: 7px 8px; border: 1px solid var(--orca-border); border-radius: 9px; background: var(--orca-bg); min-width: 0; margin: 0; }
+  #view-settings .tb-c input[type=color] { width: 34px; height: 34px; padding: 0; border: 1px solid var(--orca-border); border-radius: 8px; background: none; cursor: pointer; flex: none; }
+  #view-settings .tb-c input[type=color]::-webkit-color-swatch-wrapper { padding: 2px; }
+  #view-settings .tb-c input[type=color]::-webkit-color-swatch { border: 0; border-radius: 6px; }
+  #view-settings .tb-c div { flex: 1; min-width: 0; }
+  #view-settings .tb-c b { display: block; font-size: 12.5px; }
+  #view-settings .tb-c span { display: block; font-size: 11px; color: var(--orca-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #view-settings .tb-c input[type=text] { width: 68px; flex: none; padding: 5px 6px; border: 1px solid var(--orca-border); border-radius: 6px; background: transparent; color: var(--orca-fg); font: 12px Consolas, Menlo, "DejaVu Sans Mono", monospace !important; text-transform: uppercase; }
+  #view-settings .tb-c input.bad { border-color: #d9534f; }
+  #view-settings .tb-row { display: flex; align-items: center; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
+  #view-settings .tb-row .seg { margin: 0; }
+  #view-settings .tb-acts { display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
+  #view-settings .tb-acts button, #view-settings .tb-paste button { padding: 6px 12px; border: 1px solid var(--orca-border); border-radius: 6px; font-size: 12px; background: transparent; color: var(--orca-fg); cursor: pointer; }
+  #view-settings .tb-acts button.rs { color: var(--orca-accent); border-color: var(--orca-accent); }
+  #view-settings .tb-paste { display: flex; gap: 8px; margin-top: 10px; }
+  #view-settings .tb-paste[hidden] { display: none; }
+  #view-settings .tb-paste input { flex: 1; padding: 6px 10px; font-size: 12px; }
+  #view-settings .tp { padding: 14px; border-radius: 10px; border: 1px solid var(--orca-border); background: var(--orca-bg); }
+  #view-settings .tp-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+  #view-settings .tp-bar b { flex: 1; font-size: 14px; }
+  #view-settings .tp-bar span { padding: 5px 11px; border-radius: 6px; font-size: 12px; font-weight: 700; background: var(--orca-accent); color: var(--orca-accent-fg); }
+  #view-settings .tp-bar em { padding: 5px 11px; border-radius: 6px; font-size: 12px; font-style: normal; border: 1px solid var(--orca-border); }
+  #view-settings .tp-card { position: relative; display: flex; gap: 11px; padding: 13px 13px 10px; border-radius: var(--sp-rad); border: 1px solid var(--orca-border); background: var(--sp-card); margin-top: 10px; }
+  #view-settings .tp-tag { position: absolute; top: -8px; left: 13px; padding: 1px 8px; border-radius: 4px 9px 9px 0; font-size: 10px; font-weight: 700; background: var(--orca-accent); color: var(--orca-accent-fg); }
+  #view-settings .tp-sw { width: 38px; height: 38px; border-radius: 50%; flex: none; border: 2px solid rgba(255,255,255,.1); box-sizing: border-box; }
+  #view-settings .tp-sc { position: relative; flex: none; display: flex; align-items: flex-start; }
+  #view-settings .tp-rf { position: absolute; left: 50%; top: 100%; transform: translate(-50%, -60%); font-size: 7.5px; font-weight: 800; padding: 1px 4px; border-radius: 4px; color: #3a3d42; background: linear-gradient(135deg, #f4f5f7, #cdd1d6 35%, #8b9099 55%, #cdd1d6 75%, #f4f5f7); border: 1px solid rgba(0,0,0,.25); }
+  #view-settings .tp-cart { font-style: normal; display: inline-flex; border: 1px solid #e0a030; border-radius: 5px; padding: 0 3px; font-size: 10px; margin-left: 4px; vertical-align: 1px; }
+  #view-settings .tp-mn { flex: 1; min-width: 0; }
+  #view-settings .tp-tp { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; }
+  #view-settings .tp-tp b { font-size: 13.5px; }
+  #view-settings .tp-tr { height: 5px; border-radius: 3px; background: rgba(127,127,127,.25); margin: 6px 0 5px; overflow: hidden; }
+  #view-settings .tp-tr i { display: block; height: 100%; }
+  #view-settings .tp-sb { font-size: 11.5px; font-style: italic; color: var(--orca-muted); }
+  #view-settings .tp-ck { margin-top: 12px; display: grid; gap: 6px; }
+  #view-settings .tp-ck div { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 12px; padding: 6px 10px; border-radius: 7px; border: 1px solid var(--orca-border); }
+  #view-settings .tp-ck b { font-size: 11px; padding: 2px 8px; border-radius: 99px; white-space: nowrap; }
+  #view-settings .tp-ck b.ok { background: rgba(63,185,80,.18); color: #3fb950; }
+  #view-settings .tp-ck b.no { background: rgba(217,83,79,.18); color: #e5534b; }
+  #view-settings .tp-ck b.mid { background: rgba(224,160,48,.2); color: #e0a030; }
+  #view-settings .tp-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  #view-settings .tp-chip { padding: 3px 10px; border-radius: 99px; font-size: 12px; font-weight: 700; }
+  #view-settings .tp-chip.ok { background: rgba(63,185,80,.18); color: #3fb950; }
+  #view-settings .tp-chip.warn { background: rgba(210,153,34,.22); color: #e0a030; }
+  #view-settings .tp-chip.bad { background: rgba(217,83,79,.2); color: #e5534b; }
+  #view-settings .tp-ok { display: flex; align-items: center; gap: 6px; font-size: 12px; margin-top: 10px; }
+  #view-settings .tp-ok i { width: 8px; height: 8px; border-radius: 50%; background: #3fb950; }
+  #view-settings .tp-anim { height: 6px; border-radius: 3px; margin-top: 12px; background: linear-gradient(90deg, var(--orca-accent) 0 40%, color-mix(in srgb, var(--orca-accent) 35%, #fff) 50%, var(--orca-accent) 60% 100%); background-size: 250% 100%; animation: tpmove 1.6s linear infinite; }
+  @keyframes tpmove { from { background-position: 100% 0; } to { background-position: -150% 0; } }
+  #view-settings .ck-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 2px 14px; margin-top: 6px; }
+  #view-settings .ck-grid .check-row { margin: 0 0 8px; }
+  #view-settings .sw-opts { display: flex; gap: 8px; margin: 6px 0 14px; flex-wrap: wrap; }
+  #view-settings .sw-o { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 9px 12px 7px; min-width: 64px; border: 1px solid var(--orca-border); border-radius: 10px; cursor: pointer; font-size: 12px; background: var(--orca-bg); }
+  #view-settings .sw-o.on { border-color: var(--orca-accent); box-shadow: 0 0 0 1px var(--orca-accent); color: var(--orca-accent); font-weight: 700; }
+  #view-settings .sw-o .tp-sw { width: 30px; height: 30px; margin: 0; }
+  #view-settings .sw-o .tp-sw.pill { width: 10px !important; }
+  #th-toast { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); z-index: 1001; padding: 9px 16px; border-radius: 8px; background: var(--orca-accent); color: var(--orca-accent-fg); font-weight: 700; font-size: 13px; display: none; }
+  #th-toast.on { display: block; }
+  @media (max-width: 900px) { #view-settings .th-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } #view-settings .tb-cols { grid-template-columns: minmax(0, 1fr); } }
+"""
+
+
+def look_html() -> str:
+    fo = "".join(
+        f'<div class="fo" data-f="{k}"><div class="fo-aa" style=\'font-family:{css} !important\'>Aa</div>'
+        f'<div class="fo-t"><div class="fo-n" style=\'font-family:{css} !important\'>{n}</div>'
+        f'<div class="fo-s" style=\'font-family:{css} !important\'>{html.escape(s)}</div>'
+        f'<div class="fo-w">{w}</div></div><div class="fo-ck"></div></div>'
+        for k, n, s, w, css in LOOK_FONTS)
+    seg = "".join(f'<label><input type="radio" name="ap-size" value="{v}">{n}</label>' for v, n in LOOK_SIZES)
+    row = "".join(f'<span data-z="{v}"><i style="font-size:{round(13 * v / 100)}px">Aa</i>{v}%</span>' for v, _ in LOOK_SIZES)
+    return (
+        '<div class="srow ap-pane"><h3><span class="emoji">🔤</span>Configure Font</h3><div class="srow-body"><div class="srow-l">'
+        f'<div class="field-label">Choose the Font for the Spoolio Tab:</div><div class="fo-list" id="fo-list">{fo}</div>'
+        '<div class="hint">Each option only uses fonts that come with Windows, macOS and Linux, so nothing is downloaded. '
+        'If one is missing, the next in its list is used.</div>'
+        '</div><div class="srow-r"><div class="label">Preview</div>'
+        '<div class="ap-prev"><div class="ap-h">Desk_Organiser_Plate_1</div><div class="ap-bar"><i></i></div>'
+        '<div class="ap-nums"><span>Layer 142 / 380 · 2 h 04 min left</span><b>37%</b></div></div>'
+        '<div class="ws-card" style="margin-top:10px"><div class="ws-swatch" style="background:#2850a8"></div><div class="ws-main">'
+        '<div class="ws-top"><span class="ws-name">PETG HF - Cobalt Blue</span><span>77% · 770 g</span></div>'
+        '<div class="ws-bar"><i style="width:77%;background:#2850a8"></i></div><div class="ws-sub">PETG · #2850A8 · 1.75mm</div></div></div>'
+        '<div class="ap-prev">The quick brown fox jumps over the lazy dog. 0123456789 g · €24.10</div>'
+        '<div class="ap-note"><span>✨</span><span><b>Live Preview.</b> The whole tab changes as you pick. '
+        'Cancel puts it back, Save &amp; Close keeps it.</span></div>'
+        '</div></div></div>'
+        '<div class="srow ap-pane"><h3><span class="emoji">🔎</span>Configure Text Size</h3><div class="srow-body"><div class="srow-l">'
+        f'<div class="field-label">Show Text and Controls At:</div><div class="seg" id="ap-seg">{seg}</div>'
+        '<div class="hint">Scales everything in the Spoolio tab together, so cards, buttons and charts keep their shape.</div>'
+        '<div class="hint" style="margin-top:14px"><button class="ap-reset" id="ap-reset">Reset Font and Text Size to Default</button></div>'
+        f'</div><div class="srow-r"><div class="label">Preview</div><div class="ap-prev"><div class="sz-row" id="sz-row">{row}</div></div>'
+        '<div class="hint" style="margin-top:10px">Only the Spoolio tab changes. OrcaSlicer\'s own windows and menus keep their size.</div>'
+        '</div></div></div>'
+    )
+
+
+# Font and text size: applied live, put back on Cancel, kept on Save & Close.
+LOOK_JS = r"""
+  var F = __FONTS__, P = __THEMES__, saved = __LOOK__, KEYS = ["accent", "accentFg", "bg", "card", "border", "fg", "muted"];
+  var C = [["accent", "Accent", "Buttons and tabs"], ["accentFg", "Text on Accent", "On accent buttons"], ["bg", "Background", "Behind everything"],
+    ["card", "Cards", "Spools and panels"], ["border", "Borders", "Edges and lines"], ["fg", "Text", "Main text"], ["muted", "Muted Text", "Helper text"]];
+  var cp = function (o) { return JSON.parse(JSON.stringify(o)); }, cur = cp(saved);
+  var DEF = { font: "def", size: 100, theme: "dark", custom: cp(P.dark), density: "comfy", cols: saved.cols, swatch: "circle",
+    show: { tag: true, mat: true, hex: true, dia: true, loc: false, rfid: true, cart: true }, units: "g", wfmt: "both", motion: false, cb: false };
+  var $ = function (s) { return document.querySelector(s); }, $$ = function (s) { return Array.prototype.slice.call(document.querySelectorAll(s)); };
+  var esc = function (s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); };
+  function hx(h) { h = h.replace("#", ""); return [0, 2, 4].map(function (i) { return parseInt(h.substr(i, 2), 16); }); }
+  function lum(h) { var c = hx(h).map(function (v) { v /= 255; return v <= .03928 ? v / 12.92 : Math.pow((v + .055) / 1.055, 2.4); }); return .2126 * c[0] + .7152 * c[1] + .0722 * c[2]; }
+  function ratio(a, b) { var x = lum(a), y = lum(b); return (Math.max(x, y) + .05) / (Math.min(x, y) + .05); }
+  var pal = function (a) { return a.theme === "custom" ? a.custom : P[a.theme]; };
+  window.__spoolioAp = function () { return cur; };
+
+  function apply(a) {
+    var r = document.documentElement, p = pal(a), map = { accent: "accent", accentFg: "accent-fg", bg: "bg", border: "border", fg: "fg", muted: "muted" };
+    Object.keys(map).forEach(function (k) { r.style.setProperty("--orca-" + map[k], p[k]); });
+    r.style.setProperty("--sp-card", p.card);
+    r.style.setProperty("--sp-rad", p.radius + "px");
+    r.style.background = p.bg; r.style.color = p.fg;
+    r.classList.add("th");
+    r.classList.toggle("lt", lum(p.bg) > .4);
+    r.classList.toggle("dn-c", a.density === "compact"); r.classList.toggle("dn-s", a.density === "spacious");
+    r.style.setProperty("--sp-sw", { compact: "32px", comfy: "42px", spacious: "52px" }[a.density]);
+    ["circle", "spool", "square", "pill"].forEach(function (s) { r.classList.toggle("sw-" + s, a.swatch === s); });
+    r.classList.toggle("hd-tag", !a.show.tag); r.classList.toggle("hd-rfid", !a.show.rfid); r.classList.toggle("hd-cart", !a.show.cart);
+    r.classList.toggle("rm", a.motion); r.classList.toggle("cb", a.cb);
+    var css = F[a.font] || "";
+    r.style.setProperty("--apf", css);
+    r.classList.toggle("apf", !!css && a.font !== "def");
+    r.style.zoom = a.size === 100 ? "" : a.size / 100;
+    if (window.__spoolioRelook) window.__spoolioRelook(a);
+  }
+
+  function wt(g) {
+    if (cur.units === "kg") return (g / 1000).toFixed(g < 100 ? 3 : 2) + " kg";
+    if (cur.units === "oz") return (g / 28.3495).toFixed(1) + " oz";
+    return Math.round(g).toLocaleString("en-GB") + " g";
+  }
+  var sw = function (cls, c) { return '<div class="tp-sw ' + cls + '" style="background-color:' + c + '"></div>'; };
+  function card(nm, br, col, g, pc, sub, low) {
+    var a = cur, ws = a.wfmt === "pct" ? pc + "%" : (a.wfmt === "both" ? '<span style="color:var(--orca-muted);font-size:12px">' + pc + '% · </span>' : "") + wt(g);
+    return '<div class="tp-card">' + (a.show.tag ? '<span class="tp-tag">' + br + '</span>' : "") + '<div class="tp-sc">' + sw(a.swatch, col) + (a.show.rfid ? '<span class="tp-rf">RFID</span>' : "") + '</div>' +
+      '<div class="tp-mn"><div class="tp-tp"><b>' + nm + '</b><span' + (low ? ' style="color:' + (a.cb ? "#e69f00" : "#da5f4a") + '"' : "") + '>' + (low && a.cb ? "▼ " : "") + ws +
+      (low && a.show.cart ? ' <i class="tp-cart">🛒</i>' : "") + '</span></div>' +
+      '<div class="tp-tr"><i style="width:' + pc + '%;background:' + col + '"></i></div><div class="tp-sb">' + sub + '</div></div></div>';
+  }
+  function sub(m, h, d, l) { var a = cur.show; return [a.mat && m, a.hex && h, a.dia && d, a.loc && "📍 " + l].filter(Boolean).join(" · "); }
+  function thumb(q) {
+    return '<div class="th-m"><div style="background:' + q.bg + ';position:absolute;inset:0"><div class="bar" style="background:' + q.card + ';border-bottom:1px solid ' + q.border + '"><i style="background:' + q.accent + '"></i><i style="background:' + q.border + '"></i></div>' +
+      ["#c12e1f", "#2850a8"].map(function (c, i) {
+        return '<div class="cd" style="background:' + q.card + ';border-color:' + q.border + '"><b style="background:' + c + '"></b><s style="background:' + q.fg + ';opacity:.7;max-width:' + (i ? 50 : 70) + '%"></s><s style="background:' + q.accent + ';max-width:18%"></s></div>';
+      }).join("") + '</div></div>';
+  }
+  function themes() {
+    $("#th-grid").innerHTML = [["light", "Light", "Bright and clean"], ["dark", "Dark", "Easy on the eyes"], ["custom", "Custom", "Your own colours"]].map(function (t) {
+      return '<div class="th" data-th="' + t[0] + '">' + thumb(t[0] === "custom" ? cur.custom : P[t[0]]) + '<div class="th-f"><span class="th-n">' + t[1] + '</span><span class="fo-ck"></span></div><div class="th-s">' + t[2] + '</div></div>';
+    }).join("");
+  }
+  function pane() {
+    var from = ["light", "dark"].map(function (k) {
+      return '<button data-from="' + k + '"><i style="background:' + P[k].bg + ';border-color:' + P[k].accent + '"></i>' + (k === "light" ? "Light" : "Dark") + '</button>';
+    }).join("");
+    var cc = C.map(function (c) {
+      return '<label class="tb-c"><input type="color" data-c="' + c[0] + '"><div><b>' + c[1] + '</b><span>' + c[2] + '</span></div><input type="text" maxlength="7" spellcheck="false" data-hx="' + c[0] + '"></label>';
+    }).join("");
+    var seg = function (n, o) { return '<div class="seg" data-seg="' + n + '">' + o.map(function (x) { return '<label><input type="radio" name="th-' + n + '" value="' + x[0] + '">' + x[1] + '</label>'; }).join("") + '</div>'; };
+    var ck = function (k, t) { return '<label class="check-row"><input type="checkbox" data-show="' + k + '">' + t + '</label>'; };
+    var h =
+      '<div class="srow ap-pane th-pane"><h3><span class="emoji">🎨</span>Choose a Theme</h3><div class="th-grid" id="th-grid"></div>' +
+        '<div class="hint">Only the Spoolio tab changes. Custom starts as a copy of Dark.</div></div>' +
+      '<div class="srow ap-pane" id="tb"><h3><span class="emoji">🖌️</span>Build Your Theme</h3><div class="srow-body"><div class="srow-l">' +
+        '<div class="field-label">Start From:</div><div class="tb-from">' + from + '</div>' +
+        '<div class="tb-cols">' + cc + '</div>' +
+        '<div class="tb-row"><span class="field-label" style="margin:0">Card Corners:</span>' + seg("rad", [[4, "Sharp"], [10, "Soft"], [14, "Rounded"], [20, "Round"]]) + '</div>' +
+        '<div class="tb-acts"><button class="rs" id="tb-reset">↺ Reset Custom Theme</button><button id="tb-copy">Copy Theme Code</button><button id="tb-paste">Paste Theme Code</button></div>' +
+        '<div class="tb-paste" id="tb-pbox" hidden><input type="text" id="tb-code" spellcheck="false" placeholder="Paste a Theme Code"><button id="tb-apply">Apply</button></div>' +
+        '<div class="hint">Theme codes let you share a theme with other Spoolio users.</div>' +
+      '</div><div class="srow-r"><div class="label">Preview</div><div class="tp" id="tp"></div>' +
+        '<div class="label" style="margin-top:14px">Readability</div><div class="tp-ck" id="tp-ck"></div></div></div></div>';
+    var h2 =
+      '<div class="srow ap-pane"><h3><span class="emoji">📐</span>Configure Layout</h3><div class="srow-body"><div class="srow-l">' +
+        '<div class="field-label">Spacing:</div>' + seg("density", [["compact", "Compact"], ["comfy", "Comfortable"], ["spacious", "Spacious"]]) +
+        '<div class="hint" style="margin:-6px 0 14px">Compact fits more spools on screen.</div>' +
+        '<div class="field-label">Spool List Columns:</div>' + seg("cols", [["1", "One"], ["2", "Two"], ["auto", "Auto"]]) +
+        '<div class="hint">Auto uses two columns when the window is wide enough.</div>' +
+      '</div><div class="srow-r"><div class="label">Preview</div><div id="dn-prev"></div></div></div></div>' +
+      '<div class="srow ap-pane"><h3><span class="emoji">🧵</span>Configure Spool Cards</h3><div class="srow-body"><div class="srow-l">' +
+        '<div class="field-label">Colour Swatch:</div><div class="sw-opts">' +
+          [["circle", "Circle"], ["spool", "Spool"], ["square", "Square"], ["pill", "Pill"]].map(function (s) { return '<div class="sw-o" data-sw="' + s[0] + '">' + sw(s[0], "#2850a8") + s[1] + '</div>'; }).join("") + '</div>' +
+        '<div class="field-label">Show on Each Card:</div><div class="ck-grid">' +
+          ck("tag", "Manufacturer Tag") + ck("mat", "Material") + ck("hex", "Colour Code") + ck("dia", "Diameter") + ck("loc", "Location") + ck("rfid", "RFID Chip") + ck("cart", "Cart Button") + '</div>' +
+        '<div class="hint" style="margin-top:4px">The cart button only shows on low spools.</div>' +
+      '</div><div class="srow-r"><div class="label">Preview</div><div id="cd-prev"></div></div></div></div>' +
+      '<div class="srow ap-pane"><h3><span class="emoji">⚖️</span>Configure Weights</h3><div class="srow-body"><div class="srow-l">' +
+        '<div class="field-label">Units:</div>' + seg("units", [["g", "Grams"], ["kg", "Kilograms"], ["oz", "Ounces"]]) +
+        '<div class="field-label">Show Remaining As:</div>' + seg("wfmt", [["w", "Weight"], ["pct", "Percent"], ["both", "Both"]]) +
+        '<div class="hint">Spoolman still stores grams. Only the display changes.</div>' +
+      '</div><div class="srow-r"><div class="label">Preview</div><div class="tp" id="wt-prev"></div></div></div></div>' +
+      '<div class="srow ap-pane"><h3><span class="emoji">♿</span>Configure Accessibility</h3><div class="srow-body"><div class="srow-l">' +
+        '<label class="check-row"><input type="checkbox" id="ac-motion">Reduce Motion</label><div class="hint" style="margin:-6px 0 14px 24px">Stops moving bars, fades and slides.</div>' +
+        '<label class="check-row"><input type="checkbox" id="ac-cb">Colour-Blind Friendly Status Colours</label><div class="hint" style="margin:-6px 0 14px 24px">Uses blue and orange, plus a shape on each status.</div>' +
+        '<div class="hint ap-all"><button class="ap-reset" id="ap-all">Reset All Appearance Settings</button></div>' +
+      '</div><div class="srow-r"><div class="label">Preview</div><div class="tp"><div class="tp-chips"><span class="tp-chip ok">Enough Filament</span><span class="tp-chip warn">Running Short</span><span class="tp-chip bad">Low Stock</span></div>' +
+        '<div class="tp-ok"><i></i>Live Link Connected</div><div class="tp-anim"></div></div></div></div></div>';
+    var vs = $("#view-settings"), fp = $$("#view-settings > .ap-pane")[0], ft = $("#view-settings > .footer");
+    var d = document.createElement("div");
+    d.innerHTML = h; while (d.firstChild) vs.insertBefore(d.firstChild, fp);
+    d.innerHTML = h2; while (d.firstChild) vs.insertBefore(d.firstChild, ft);
+    document.body.insertAdjacentHTML("beforeend", '<div id="th-toast"></div>');
+  }
+  function toast(s) { var t = $("#th-toast"); t.textContent = s; t.classList.add("on"); clearTimeout(t._t); t._t = setTimeout(function () { t.classList.remove("on"); }, 2600); }
+  function code() { return "SPOOLIO-THEME:" + btoa(JSON.stringify(cur.custom)); }
+  function copy() {
+    var c = code(), done = function () { toast("✓ Theme Code Copied"); };
+    var old = function () {
+      var t = document.createElement("textarea"); t.value = c; document.body.appendChild(t); t.select();
+      try { document.execCommand("copy"); done(); } catch (e) { toast("Couldn't Copy. Select the Code in the Box Instead."); }
+      t.remove();
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(c).then(done, old); else old();
+  }
+  function paste(t) {
+    try {
+      var o = JSON.parse(atob(String(t).trim().replace(/^SPOOLIO-THEME:/i, "")));
+      KEYS.forEach(function (k) { if (!/^#[0-9a-f]{6}$/i.test(o[k])) throw 0; });
+      cur.custom = { radius: [4, 10, 14, 20].indexOf(o.radius) >= 0 ? o.radius : 14 };
+      KEYS.forEach(function (k) { cur.custom[k] = o[k].toLowerCase(); });
+      cur.theme = "custom"; $("#tb-pbox").hidden = true; sync(); toast("✓ Theme Applied");
+    } catch (e) { toast("That Isn't a Spoolio Theme Code."); }
+  }
+  function prev() {
+    var p = pal(cur);
+    $("#tp").innerHTML = '<div class="tp-bar"><b>Spools</b><em>Filters ▾</em><span>+ Add Spool</span></div>' +
+      card("PETG HF - Cobalt Blue", "Bambu Lab", "#2850a8", 770, 77, sub("PETG", "#2850A8", "1.75mm", "AMS 1")) +
+      card("PLA Basic - Jade White", "Bambu Lab", "#f2f2ec", 32, 3, sub("PLA", "#F2F2EC", "1.75mm", "Shelf"), 1);
+    var r = function (n, a, b) { var v = ratio(a, b); return '<div><span>' + n + '</span><b class="' + (v >= 4.5 ? "ok" : v >= 3 ? "mid" : "no") + '">' + v.toFixed(1) + ' : 1 · ' + (v >= 4.5 ? "Easy to Read" : v >= 3 ? "Hard to Read" : "Too Faint") + '</b></div>'; };
+    $("#tp-ck").innerHTML = r("Text on Cards", p.fg, p.card) + r("Helper Text", p.muted, p.card) + r("Accent Buttons", p.accentFg, p.accent);
+    var pad = { compact: "7px 10px 5px", comfy: "12px 13px 9px", spacious: "17px 16px 14px" }[cur.density];
+    $("#dn-prev").innerHTML = '<div class="tp" style="padding:4px 12px 10px">' + [["PLA Matte - Black", "#111111", 640, 64], ["PLA Basic - Red", "#c12e1f", 530, 53], ["PETG HF - Cobalt Blue", "#2850a8", 770, 77]].map(function (s) {
+      return card(s[0], "Bambu Lab", s[1], s[2], s[3], sub("PLA", s[1].toUpperCase(), "1.75mm", "AMS 1")).replace('class="tp-card"', 'class="tp-card" style="padding:' + pad + '"');
+    }).join("") + '</div>';
+    $("#cd-prev").innerHTML = '<div class="tp" style="padding-top:4px">' + card("PLA Basic - Jade White", "Bambu Lab", "#f2f2ec", 32, 3, sub("PLA", "#F2F2EC", "1.75mm", "Shelf"), 1) + '</div>';
+    $("#wt-prev").innerHTML = [["PLA Matte - Black", "#111111", 640, 64], ["PLA Basic - Jade White", "#f2f2ec", 32, 3]].map(function (s, i) {
+      return card(s[0], "Bambu Lab", s[1], s[2], s[3], sub("PLA", s[1].toUpperCase(), "1.75mm", "AMS 1"), i);
+    }).join("");
+  }
+  function sync(src) {
+    themes();
+    $$("#th-grid .th").forEach(function (o) { o.classList.toggle("on", o.dataset.th === cur.theme); });
+    $("#tb").style.display = cur.theme === "custom" ? "" : "none";
+    KEYS.forEach(function (k) {
+      var c = $('[data-c="' + k + '"]'), x = $('[data-hx="' + k + '"]');
+      if (c !== src) c.value = cur.custom[k];
+      if (x !== src) { x.value = cur.custom[k].toUpperCase(); x.classList.remove("bad"); }
+    });
+    var segv = { rad: String(cur.custom.radius), density: cur.density, cols: cur.cols, units: cur.units, wfmt: cur.wfmt };
+    Object.keys(segv).forEach(function (n) { $$('input[name="th-' + n + '"]').forEach(function (i) { i.checked = i.value === segv[n]; i.parentNode.classList.toggle("on", i.checked); }); });
+    $$(".sw-o").forEach(function (o) { o.classList.toggle("on", o.dataset.sw === cur.swatch); });
+    $$("[data-show]").forEach(function (i) { i.checked = !!cur.show[i.dataset.show]; });
+    $("#ac-motion").checked = cur.motion; $("#ac-cb").checked = cur.cb;
+    $$("#fo-list .fo").forEach(function (o) { o.classList.toggle("on", o.dataset.f === cur.font); });
+    $$("#ap-seg label").forEach(function (l) { var i = l.querySelector("input"); i.checked = +i.value === cur.size; l.classList.toggle("on", i.checked); });
+    $$("#sz-row span").forEach(function (s) { s.classList.toggle("on", +s.dataset.z === cur.size); });
+    apply(cur); prev();
+  }
+  function tab(t) {
+    $$("#tabs-set button").forEach(function (b) { b.classList.toggle("on", b.dataset.st === t); });
+    $("#view-settings").classList.toggle("ap-on", t === "appearance");
+    window.scrollTo(0, 0);
+  }
+  window.__spoolioLook = function () { return cp(cur); };
+  pane();
+  $("#tabs-set").addEventListener("click", function (e) { var b = e.target.closest("button"); if (b) tab(b.dataset.st); });
+  var vs = $("#view-settings");
+  vs.addEventListener("click", function (e) {
+    var x, id = e.target.id;
+    if ((x = e.target.closest(".fo"))) { cur.font = x.dataset.f; sync(); }
+    if ((x = e.target.closest("[data-th]"))) { cur.theme = x.dataset.th; sync(); }
+    if ((x = e.target.closest("[data-from]"))) { cur.custom = cp(P[x.dataset.from]); cur.theme = "custom"; sync(); }
+    if ((x = e.target.closest(".sw-o"))) { cur.swatch = x.dataset.sw; sync(); }
+    if (id === "ap-reset") { cur.font = "def"; cur.size = 100; sync(); }
+    if (id === "tb-reset") { cur.custom = cp(P.dark); sync(); }
+    if (id === "ap-all") { cur = cp(DEF); sync(); }
+    if (id === "tb-copy") copy();
+    if (id === "tb-paste") { $("#tb-pbox").hidden = false; $("#tb-code").value = ""; $("#tb-code").focus(); }
+    if (id === "tb-apply") paste($("#tb-code").value);
+  });
+  vs.addEventListener("input", function (e) {
+    var k = e.target.dataset.c || e.target.dataset.hx; if (!k) return;
+    var v = e.target.value.trim(); if (v[0] !== "#") v = "#" + v;
+    var ok = /^#[0-9a-f]{6}$/i.test(v); e.target.classList.toggle("bad", !ok);
+    if (!ok) return;
+    cur.custom[k] = v.toLowerCase(); cur.theme = "custom"; sync(e.target);
+  });
+  vs.addEventListener("change", function (e) {
+    var n = e.target.name || "", sh = e.target.dataset.show;
+    if (n === "ap-size") { cur.size = +e.target.value; sync(); }
+    if (n.indexOf("th-") === 0) { var k = n.slice(3), v = e.target.value; if (k === "rad") { cur.custom.radius = +v; cur.theme = "custom"; } else cur[k] = v; sync(); }
+    if (sh) { cur.show[sh] = e.target.checked; sync(); }
+    if (e.target.id === "ac-motion") { cur.motion = e.target.checked; sync(); }
+    if (e.target.id === "ac-cb") { cur.cb = e.target.checked; sync(); }
+  });
+  bridge.onMessage(function (d) {
+    if (!d || d.type !== "show_view") return;
+    var on = d.view === "settings";
+    $("#tabs-set").classList.toggle("view-hidden", !on);
+    if (d.appearance) saved = d.appearance;
+    cur = cp(saved);
+    sync();
+    if (on) tab("general");
+  });
+  sync();
+"""
+
+
 def tab_html(initial_view: str, c: dict) -> str:
     """The spool list and Settings as two views of one page, under a shared header."""
     main_css, main_body, main_js = _split_page(main_html())
@@ -6149,13 +7362,26 @@ def tab_html(initial_view: str, c: dict) -> str:
     settings_view = "\n".join([
         card(sec["server"], "How It Works", sec["steps"]),
         card(sec["reorder"], "Preview", TAB_PREVIEW_HTML),
-        card(sec["weights"], "Preview", sec["weights-preview"]),
-        card(sec["layout"], "Preview", sec["layout-preview"]),
+        card(sec["weights"], "Preview", sec["weights-preview"]).replace('class="srow"', 'class="srow moved"', 1),
+        card(sec["layout"], "Preview", sec["layout-preview"]).replace('class="srow"', 'class="srow moved"', 1),
         card(sec["check"], "Before You Start", sec["check-hint"]),
         card(sec["printer"], "Preview", sec["printer-preview"]),
         card(sec["stats"], "Preview", sec["stats-preview"]),
+        look_html(),
         footer,
     ])
+    main_scoped = _scope_css(main_css, "#view-main")
+    # The card's preview and RFID label reuse the spool list's own card styles.
+    pv = "".join(m.group(0).replace("#view-main", "#pc .pv") + "\n"
+                 for m in re.finditer(r"#view-main \.spool[^{}]*\{[^}]*\}", main_scoped))
+    pv += "".join(m.group(0).replace("#view-main", "#pc .fl") + "\n"
+                  for m in re.finditer(r"#view-main \.spool-rfid[^{}]*\{[^}]*\}", main_scoped))
+    pv += "#pc .fl .spool-rfid { display: inline-flex; vertical-align: middle; margin: 0; }\n"
+    look_js = (LOOK_JS.replace("__FONTS__", json.dumps({k: css for k, _, _, _, css in LOOK_FONTS}))
+               .replace("__THEMES__", json.dumps(THEMES))
+               .replace("__LOOK__", json.dumps(c.get("appearance") or parse_look(None))))
+    set_tabs = ('<div class="tabs"><button data-st="general" class="on">General</button>'
+                '<button data-st="appearance">Appearance</button></div>')
     return f"""<!doctype html>
 <html>
 <head>
@@ -6163,19 +7389,23 @@ def tab_html(initial_view: str, c: dict) -> str:
 <link rel="icon" href="{LOGO_DATA_URI}">
 <style>
   html, body {{ height: 100%; margin: 0; background: var(--orca-bg); overscroll-behavior-x: none; }}
-  body {{ box-sizing: border-box; padding-top: 76px; }}
+  body {{ box-sizing: border-box; padding-top: 76px; color: var(--orca-fg); }}
   .view-hidden {{ display: none !important; }}
   #view-settings {{ min-height: 100%; max-width: 1100px; }}
 {_fill(TAB_HEADER_CSS, FONT=FONT_STACK)}
-{_scope_css(main_css, "#view-main")}
+{main_scoped}
 {_scope_css(settings_css, "#view-settings")}
 {TAB_SETTINGS_CSS}
+{LOOK_CSS}
+{_fill(EDITOR_CSS, FONT=FONT_STACK)}
+{pv}
 </style>
 </head>
 <body>
 <div id="app-header">
   {LOGO_IMG}<h2>Spoolio</h2>
   <span id="tabs-main" class="{_hidden(not on_main)}">{tabs_bar}</span>
+  <span id="tabs-set" class="{_hidden(on_main)}">{set_tabs}</span>
   <div class="header-actions">
     <span id="actions-main" class="{_hidden(not on_main)}">{settings_button}</span>
     <span id="actions-settings" class="{_hidden(on_main)}">{feedback_button}</span>
@@ -6187,6 +7417,8 @@ def tab_html(initial_view: str, c: dict) -> str:
 <script>(function (orca) {{{main_js}}})(window.__spoolio.main);</script>
 <script>(function (orca) {{{settings_js}}})(window.__spoolio.settings);</script>
 <script>(function (bridge) {{{TAB_PREVIEW_JS}}})(window.__spoolio.settings);</script>
+<script>(function (bridge) {{{look_js}}})(window.__spoolio.settings);</script>
+<script>(function (orca) {{{EDITOR_JS}}})(window.__spoolio.main);</script>
 </body>
 </html>
 """
@@ -6246,7 +7478,15 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
             elif msg_type == "heads_bind" and _sliced["slots"]:
                 _bg(run_heads, _sliced["slots"], _sliced["preset"], str(data.get("id") or ""))
             elif msg_type == "live":
-                self.post_message({"type": "live", "live": live_poll(), "usage": usage_state()})
+                self.post_message({"type": "live", "live": live_poll(), "usage": usage_state(), "new": new_spools()})
+            elif msg_type == "editor":
+                _bg(lambda: self.post_message({"type": "editor", **editor_data()}))
+            elif msg_type == "catalogue":
+                _bg(lambda: self.post_message({"type": "catalogue", "q": data.get("q") or "", **catalogue(data.get("q"))}))
+            elif msg_type == "spool_save":
+                _bg(self._spool_save, data)
+            elif msg_type == "new_skip":
+                new_skip(data.get("uid"))
             elif msg_type == "printer_code":
                 save_printer_code(data.get("id"), data.get("code"))
             elif msg_type == "printer_test":
@@ -6264,6 +7504,12 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
 
     def _spoolman_url(self):
         return cfg().get("spoolman_url", "")
+
+    def _spool_save(self, data):
+        result = spool_save(data)
+        self.post_message({"type": "spool_saved", **result})
+        if result["ok"]:
+            self._push_data()
 
     def _push_data(self):
         url = self._spoolman_url()
@@ -6290,13 +7536,14 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
                 self._refreshing = False
             self.post_message({"type": "spools", "low_stock_grams": low_stock_grams,
                                "weight_display": weight_mode(), "show_cart": cart_on(),
-                               "spool_columns": spool_columns(), **printer_state(), **result})
+                               "spool_columns": spool_columns(), "can_edit": source() == "spoolman",
+                               **printer_state(), **result})
 
         _bg(worker)
 
     def _save_settings(self, url, low_stock, plate_check=True,
                        plate_margin=DEFAULT_MARGIN, weight="both", cart=False, src="spoolman",
-                       progress=None, columns=None, stats=None):
+                       progress=None, columns=None, stats=None, look=None):
         settings = {}
 
         def put(s):
@@ -6314,6 +7561,11 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
                 s["progress"] = parse_progress(progress)
             if stats is not None:
                 s["stats"] = parse_stats(stats)
+            if look is not None:
+                ap = s["appearance"] = parse_look(look, s)
+                s["weight_display"] = {v: k for k, v in WFMT.items()}[ap["wfmt"]]
+                if ap["cols"] != "auto":
+                    s["spool_columns"] = int(ap["cols"])
             settings.update(s)
 
         if cfg_edit(put):
@@ -6341,7 +7593,7 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
         self.post_message({**data, "view": "settings"})
 
     def _settings_close(self):
-        self.post_message({"type": "show_view", "view": "main"})
+        self.post_message({"type": "show_view", "view": "main", "appearance": ui_cfg()["appearance"]})
 
     def _check_connection(self, url, src=None):
         if self._testing:
@@ -6394,7 +7646,7 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
             saved = self._save_settings(url, data.get("low_stock"), data.get("plate_check"),
                                         data.get("plate_margin"), data.get("weight_display"),
                                         data.get("show_cart"), src, data.get("progress"),
-                                        data.get("spool_columns"), data.get("stats"))
+                                        data.get("spool_columns"), data.get("stats"), data.get("appearance"))
             if saved:
                 self._after_save()
                 self._settings_close()
