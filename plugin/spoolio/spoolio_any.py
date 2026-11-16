@@ -2366,7 +2366,7 @@ def _fil(f: dict) -> dict:
     return {"id": f.get("id"), "v": (f.get("vendor") or {}).get("name") or "", "n": f.get("name") or "",
             "m": f.get("material") or "", "c": _first_hex(f), "w": f.get("weight"), "sw": f.get("spool_weight"),
             "d": f.get("density"), "dia": f.get("diameter"), "e": f.get("settings_extruder_temp"),
-            "b": f.get("settings_bed_temp")}
+            "b": f.get("settings_bed_temp"), "t": _tvals(f.get("extra"))}
 
 
 def _ext(f: dict) -> dict:
@@ -2387,7 +2387,8 @@ def editor_data() -> dict:
     code = spoolman_currency(clean_url(cfg().get("spoolman_url")))
     out = []
     for f in sorted(fields, key=lambda x: (x.get("order") or 0, x.get("name") or "")):
-        if isinstance(f, dict) and f.get("key") and f.get("field_type") in FIELD_TYPES:
+        if isinstance(f, dict) and f.get("key") and f.get("field_type") in FIELD_TYPES \
+                and f["key"] not in TUNE_KEYS and f["key"] != PA_BY:
             out.append({"key": f["key"], "name": f.get("name") or f["key"], "type": f["field_type"],
                         "unit": f.get("unit") or "", "choices": f.get("choices") or [],
                         "multi": bool(f.get("multi_choice"))})
@@ -2400,7 +2401,10 @@ def _use_data() -> dict:
     """The printers a spool's presets can be limited to, when OrcaSlicer presets are on."""
     c = parse_presets(cfg().get("presets"))
     prs = [{"id": p["id"], "name": p["name"]} for p in printers_cfg() if c["printers"].get(p["id"], {}).get("on")]
-    return {"use_printers": prs if c["on"] else [], "use": c["use"]}
+    tn = c["on"] and c["tune"]["on"]
+    return {"use_printers": prs if c["on"] else [], "use": c["use"],
+            "tune": {"on": tn, "per": c["per"], "printers": [p["name"] for p in prs],
+                     "keys": [{"k": t[0], "key": t[1], "l": t[2], "u": t[4]} for t in TUNE if c["tune"]["keys"][t[0]]]}}
 
 
 def catalogue(query: object) -> dict:
@@ -2499,6 +2503,15 @@ def spool_save(d: dict) -> dict:
     except Exception as exc:
         log.warning("Saving a spool to Spoolman failed: %s", exc)
         return {"ok": False, "error": _sm_err(exc)}
+    tn = d.get("tune") if isinstance(d.get("tune"), dict) else {}
+    try:
+        if isinstance(tn.get("fil"), dict) and fid:
+            tune_save("filament", fid, tn["fil"])
+        if isinstance(tn.get("spool"), dict) and sid:
+            tune_save("spool", sid, tn["spool"])
+    except Exception as exc:
+        log.warning("Saving tuning to Spoolman failed: %s", exc)
+        return {"ok": False, "error": _sm_err(exc), "id": sid}
     if isinstance(d.get("use"), list):
         ids = [str(i)[:32] for i in d["use"][:8]]
 
@@ -2532,6 +2545,7 @@ def _where(unit_id: int, slot: int) -> str:
 PRESET_ID = "spoolio"
 NOZZLE_RE = re.compile(r"\s*[(\-]?\s*\d+(?:\.\d+)?\s*(?:mm\s*)?nozzle\)?", re.I)
 _pst: dict = {"n": 0, "time": "", "err": ""}
+_pmap: dict = {}
 _psync = threading.Lock()
 
 
@@ -2540,6 +2554,9 @@ def parse_presets(value: object) -> dict:
     pr = v.get("printers") if isinstance(v.get("printers"), dict) else {}
     bs = v.get("bases") if isinstance(v.get("bases"), dict) else {}
     us = v.get("use") if isinstance(v.get("use"), dict) else {}
+    tk = v.get("take") if isinstance(v.get("take"), dict) else {}
+    tn = v.get("tune") if isinstance(v.get("tune"), dict) else {}
+    tnk = tn.get("keys") if isinstance(tn.get("keys"), dict) else {}
     return {"on": parse_flag(v.get("on"), default=False),
             "per": "spool" if v.get("per") == "spool" else "filament",
             "base": "pick" if v.get("base") == "pick" else "auto",
@@ -2548,7 +2565,10 @@ def parse_presets(value: object) -> dict:
                          for k, x in list(pr.items())[:8] if isinstance(x, dict)},
             "bases": {str(k)[:24]: str(x)[:120] for k, x in list(bs.items())[:40] if isinstance(x, str)},
             "use": {str(k)[:16]: [str(i)[:32] for i in x[:8]] for k, x in list(us.items())[-500:]
-                    if isinstance(x, list) and x}}
+                    if isinstance(x, list) and x},
+            "take": {k: parse_flag(tk.get(k)) for k in TAKE},
+            "tune": {"on": parse_flag(tn.get("on"), default=False),
+                     "keys": {t[0]: parse_flag(tnk.get(t[0]), default=False) for t in TUNE}}}
 
 
 def _papi():
@@ -2727,23 +2747,38 @@ def build_presets(c: dict, spools: list, pb, only: str = "") -> list[dict]:
                 continue
             d = {"type": "filament", "name": name, "from": "User", "instantiation": "true", "inherits": base,
                  "filament_settings_id": [name], "compatible_printers": nz, "compatible_printers_condition": ""}
+            tk = c["take"]
             hx = _first_hex(f)
-            if hx:
+            if hx and tk["colour"]:
                 d["filament_colour"] = ["#" + hx.upper()]
             ven = (f.get("vendor") or {}).get("name")
             if ven:
                 d["filament_vendor"] = [ven]
-            for k, keys in (("settings_extruder_temp", ("nozzle_temperature", "nozzle_temperature_initial_layer")),
-                            ("settings_bed_temp", ("hot_plate_temp", "hot_plate_temp_initial_layer",
-                                                   "textured_plate_temp", "textured_plate_temp_initial_layer")),
-                            ("density", ("filament_density",)), ("diameter", ("filament_diameter",))):
+            for k, keys, on in (("settings_extruder_temp", ("nozzle_temperature", "nozzle_temperature_initial_layer"), tk["temps"]),
+                                ("settings_bed_temp", ("hot_plate_temp", "hot_plate_temp_initial_layer",
+                                                       "textured_plate_temp", "textured_plate_temp_initial_layer"), tk["temps"]),
+                                ("density", ("filament_density",), tk["dens"]), ("diameter", ("filament_diameter",), tk["dens"])):
                 v = _num_or(f.get(k))
-                if v:
+                if v and on:
                     d.update({x: [str(v)] for x in keys})
-            cost = _kg_cost(sp, f)
+            cost = _kg_cost(sp, f) if tk["cost"] else None
             if cost:
                 d["filament_cost"] = [str(cost)]
-            out.append({"file": _pfile(name), "json": d, "spool": sp, "printer": p, "cost": cost})
+            exp, lvl, tv = {}, {}, {}
+            if c["tune"]["on"]:
+                tv, lvl = tune_of(sp, c["per"])
+                bp = pb.filaments.find_preset(base)
+                for t in TUNE:
+                    if not c["tune"]["keys"][t[0]]:
+                        continue
+                    v = tv["by"].get(p["name"], tv["pa"]) if t[0] == "pa" else tv[t[0]]
+                    if v is not None:
+                        d[t[3]] = [str(v)]
+                        if t[0] == "pa":
+                            d["enable_pressure_advance"] = ["1"]
+                    exp[t[0]] = v if v is not None else (_n1(bp.config_value(t[3])) if bp else None)
+            out.append({"file": _pfile(name), "json": d, "spool": sp, "printer": p, "cost": cost, "exp": exp,
+                        "lvl": lvl, "tv": tv})
     return out
 
 
@@ -2768,7 +2803,10 @@ def presets_sync(spools: list | None = None, force: bool = False) -> dict:
             if spools is None:
                 url = cfg().get("spoolman_url", "")
                 spools = _spool_cache["spools"] if _spool_cache["url"] == url else get_spools(url).get("spools") or []
-            files = {e["file"]: json.dumps(e["json"], indent=2) + "\n" for e in build_presets(c, spools, pb)}
+            es = build_presets(c, spools, pb)
+            files = {e["file"]: json.dumps(e["json"], indent=2) + "\n" for e in es}
+            _pmap.clear()
+            _pmap.update({e["json"]["name"]: e for e in es})
         old = {p.name: p.read_text(encoding="utf-8") for p in fd.glob("*.json")} if fd.is_dir() else {}
         if files == old and not force and not _pst["err"]:
             return dict(_pst)
@@ -2833,7 +2871,7 @@ def presets_info(want: object = None) -> dict:
             sp = dict(e["spool"], rfid_tags=sorted(spool_tags(e["spool"])))
             j = e["json"]
             sign = CUR_SIGNS.get(_cur["code"], _cur["code"] + " " if _cur["code"] else "€")
-            rows = [["Colour", (j.get("filament_colour") or ["-"])[0]],
+            rows = [["Colour", (j.get("filament_colour") or ["From Base Preset"])[0]],
                     ["Type and Vendor", ", ".join(x for x in (str(e["spool"]["filament"].get("material") or ""),
                                                               (j.get("filament_vendor") or [""])[0]) if x) or "-"],
                     ["Nozzle Temperature", f"{j['nozzle_temperature'][0]} °C" if "nozzle_temperature" in j else "From Base Preset"],
@@ -2841,13 +2879,223 @@ def presets_info(want: object = None) -> dict:
                     ["Density and Diameter", ", ".join(x for x in (
                         f"{j['filament_density'][0]} g/cm³" if "filament_density" in j else "",
                         f"{j['filament_diameter'][0]} mm" if "filament_diameter" in j else "") if x) or "From Base Preset"],
-                    ["Cost", f"{sign}{e['cost']:.2f} per kg" if e["cost"] else "From Base Preset"],
-                    ["Based On", j["inherits"]]]
+                    ["Cost", f"{sign}{e['cost']:.2f} per kg" if e["cost"] else "From Base Preset"]]
+            for t in TUNE:
+                if c["tune"]["on"] and c["tune"]["keys"][t[0]]:
+                    v = (j.get(t[3]) or [None])[0]
+                    by = t[0] == "pa" and first["name"] in e["tv"].get("by", {})
+                    txt = f"{v} {t[4]}".strip() + (f" ({first['name']})" if by else "")
+                    rows.append([t[2], txt if v else "From Base Preset"])
+            rows.append(["Based On", j["inherits"]])
             out["sample"] = {"spool": sp, "name": j["name"], "printer": first["name"], "base": j["inherits"],
                              "colour": (j.get("filament_colour") or [""])[0], "rows": rows,
                              "list": [{"n": x["json"]["name"], "c": (x["json"].get("filament_colour") or [""])[0]}
                                       for x in es[:6]], "more": max(0, len(es) - 6)}
     return out
+
+
+TUNE = (("flow", "flow_ratio", "Flow Ratio", "filament_flow_ratio", ""),
+        ("pa", "pressure_advance", "Pressure Advance", "pressure_advance", ""),
+        ("mvs", "max_volumetric_speed", "Max Volumetric Speed", "filament_max_volumetric_speed", "mm³/s"),
+        ("rlen", "retraction_length", "Retraction Length", "filament_retraction_length", "mm"),
+        ("rspd", "retraction_speed", "Retraction Speed", "filament_retraction_speed", "mm/s"))
+TUNE_KEYS = {t[1] for t in TUNE}
+PA_BY = "pressure_advance_printers"
+TAKE = ("colour", "temps", "dens", "cost")
+_tune_q: dict = {}
+
+
+def _xv(ex: object, key: str):
+    """A Spoolman extra value as a number, or for PA_BY a {printer name: number} map."""
+    v = ex.get(key) if isinstance(ex, dict) else None
+    for _ in range(2):
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except ValueError:
+                break
+    if key == PA_BY:
+        return {str(k)[:40]: n for k, x in v.items() if (n := _num_or(x)) is not None} if isinstance(v, dict) else {}
+    return _num_or(v) if not isinstance(v, bool) else None
+
+
+def _tvals(ex: object) -> dict:
+    out = {t[0]: _xv(ex, t[1]) for t in TUNE}
+    out["by"] = _xv(ex, PA_BY)
+    return out
+
+
+def tune_of(sp: dict, per: str) -> tuple[dict, dict]:
+    """Tuning for a spool: its own values first (one preset per spool only), then its filament's."""
+    f = _tvals((sp.get("filament") or {}).get("extra"))
+    s = _tvals(sp.get("extra")) if per == "spool" else {"by": {}}
+    lvl = {}
+    out = {}
+    for t in TUNE:
+        k = t[0]
+        out[k], lvl[k] = (s[k], "spool") if s.get(k) is not None else (f[k], "fil")
+    out["by"] = {**f["by"], **s["by"]}
+    lvl["by"] = "spool" if s["by"] else "fil"
+    return out, lvl
+
+
+def _n1(v: object):
+    return _num_or(re.split(r"[,;]", str(v if v is not None else "").replace('"', ""))[0].strip())
+
+
+def _tune_fields(ent: str, keys: list[str]) -> None:
+    have = {f.get("key") for f in sm_req("GET", f"field/{ent}") or [] if isinstance(f, dict)}
+    names = {t[1]: t[2] for t in TUNE}
+    names[PA_BY] = "Pressure Advance by Printer"
+    for k in keys:
+        if k not in have:
+            sm_req("POST", f"field/{ent}/{k}", {"name": names[k], "field_type": "text" if k == PA_BY else "float"})
+
+
+def tune_save(ent: str, eid: int, vals: dict) -> None:
+    """Writes tuning values to a Spoolman filament or spool; an empty value removes it."""
+    vals = {k: v for k, v in vals.items() if k in TUNE_KEYS or k == PA_BY}
+    if not vals or not eid:
+        return
+    sent = {}
+    for k, v in vals.items():
+        if k == PA_BY:
+            m = {str(p)[:40]: n for p, x in (v or {}).items() if (n := _num_or(x)) is not None} if isinstance(v, dict) else {}
+            sent[k] = json.dumps(m) if m else ""
+        else:
+            n = _num_or(v)
+            sent[k] = n if n is not None else ""
+    _tune_fields(ent, [k for k, v in sent.items() if v != ""])
+    raw = (sm_req("GET", f"{ent}/{eid}") or {}).get("extra") or {}
+    sm_req("PATCH", f"{ent}/{eid}", {"extra": _extra_raw(sent, raw)})
+    _spool_cache["time"] = 0.0
+
+
+def tune_orca() -> dict:
+    """Flow ratio and the rest from the filament preset being edited in OrcaSlicer."""
+    api = _papi()
+    if not api:
+        return {"ok": False, "error": "This version of OrcaSlicer can't share its presets."}
+    pb = api[0]
+    try:
+        p = pb.filaments.edited_preset()
+        pr = pb.printers.selected_preset_name()
+    except Exception as exc:
+        return {"ok": False, "error": f"Couldn't read OrcaSlicer's filament preset: {exc}"}
+    vals = {t[0]: _n1(p.config_value(t[3])) for t in TUNE}
+    groups = _groups(pb)
+    c = parse_presets(cfg().get("presets"))
+    who = next((x["name"] for x in printers_cfg()
+                if pr in groups.get(c["printers"].get(x["id"], {}).get("group") or _guess(x, groups), [])), "")
+    name = p.name.split("/")[-1] if p.name.startswith("_local/") else p.name
+    return {"ok": True, "vals": vals, "printer": who, "preset": name}
+
+
+def _tune_item(src: str, sp: dict, p: dict, k: str, old, new, lvl: str) -> dict | None:
+    if new is None or (old is not None and abs(float(new) - float(old)) < 1e-6):
+        return None
+    f = sp.get("filament") or {}
+    iid = f"{f.get('id')}|{sp.get('id') if lvl == 'spool' else ''}|{p['id']}|{k}|{new}"
+    if iid in (cfg().get("tune_skip") or []):
+        return None
+    lab = next(t[2] for t in TUNE if t[0] == k)
+    return {"id": iid, "src": src, "fid": f.get("id"), "sid": sp.get("id"), "lvl": lvl, "k": k, "label": lab,
+            "pid": p["id"], "printer": p["name"], "name": str(f.get("name") or f"Spool #{sp.get('id')}"),
+            "c": _first_hex(f), "old": old, "new": new}
+
+
+def tune_check(ctx) -> None:
+    """After a slice: offers to save tuning values that differ from what Spoolio put in its preset."""
+    c = parse_presets(cfg().get("presets"))
+    if not (c["on"] and c["tune"]["on"] and _pmap):
+        return
+    names = split_list(ctx.config_value("filament_settings_id"))
+    keys = [t for t in TUNE if c["tune"]["keys"][t[0]]]
+    cols = {t[0]: split_list(ctx.config_value(t[3])) for t in keys}
+    new = 0
+    for i, n in enumerate(names):
+        e = _pmap.get(n.split("/", 2)[-1] if n.startswith("_local/") else n)
+        if not e:
+            continue
+        for t in keys:
+            v = _num_or(cols[t[0]][i].strip()) if i < len(cols[t[0]]) else None
+            it = _tune_item("slice", e["spool"], e["printer"], t[0], e["exp"].get(t[0]), v,
+                            "fil" if t[0] == "pa" else e["lvl"].get(t[0], "fil"))
+            if it and it["id"] not in _tune_q:
+                _tune_q[it["id"]] = it
+                new += 1
+    if new:
+        _bg(_tune_push)
+
+
+def _tune_push() -> None:
+    time.sleep(NOTICE_DELAY)
+    page = _plate["page"]
+    if page is not None:
+        page.post_message({"type": "tune", "items": tune_items()})
+
+
+def live_tune() -> list[dict]:
+    """Bambu AMS trays whose calibrated pressure advance (K) differs from Spoolman's."""
+    c = parse_presets(cfg().get("presets"))
+    url = cfg().get("spoolman_url", "")
+    if not (c["on"] and c["tune"]["on"] and c["tune"]["keys"]["pa"]) or _spool_cache["url"] != url:
+        return []
+    tags = {t: sp for sp in _spool_cache["spools"] if isinstance(sp, dict) and not sp.get("archived")
+            for t in spool_tags(sp)}
+    prs = {p["id"]: p for p in printers_cfg()}
+    out = []
+    with _live_lock:
+        states = [dict(st) for st in _live["printers"].values() if st.get("kind") != "net" and st.get("link") in prs]
+    for st in states:
+        trays = [t for u in st["units"].values() for t in u.values()] + ([st["ext"]] if st["ext"] else [])
+        for t in trays:
+            if _int(t.get("cali_idx"), -1) < 0:
+                continue
+            sp = next((tags[i] for i in _tag_ids(t.get("tray_uuid")) if i in tags), None)
+            k = _num_or(t.get("k"))
+            if not sp or k is None:
+                continue
+            p = prs[st["link"]]
+            tv, _ = tune_of(sp, c["per"])
+            it = _tune_item("printer", sp, p, "pa", tv["by"].get(p["name"], tv["pa"]), k, "fil")
+            if it:
+                out.append(it)
+    return out
+
+
+def tune_items() -> list[dict]:
+    seen = set(cfg().get("tune_skip") or [])
+    items = [x for x in _tune_q.values() if x["id"] not in seen]
+    ids = {x["id"] for x in items}
+    return (items + [x for x in live_tune() if x["id"] not in ids])[:12]
+
+
+def tune_apply(ids: object, save: bool) -> dict:
+    """Update Spoolman with the chosen new tuning values, or stop asking about them."""
+    want = set(ids) if isinstance(ids, list) else set()
+    items = [x for x in tune_items() if x["id"] in want]
+    if not save:
+        cfg_edit(lambda s: s.update(tune_skip=(list(s.get("tune_skip") or []) + [x["id"] for x in items])[-300:]))
+        for x in items:
+            _tune_q.pop(x["id"], None)
+        return {"ok": True}
+    try:
+        for x in items:
+            if x["k"] == "pa":
+                by = _xv((sm_req("GET", f"filament/{x['fid']}") or {}).get("extra"), PA_BY)
+                by[x["printer"]] = x["new"]
+                tune_save("filament", x["fid"], {PA_BY: by})
+            else:
+                key = next(t[1] for t in TUNE if t[0] == x["k"])
+                tune_save("spool" if x["lvl"] == "spool" else "filament",
+                          x["sid"] if x["lvl"] == "spool" else x["fid"], {key: x["new"]})
+            _tune_q.pop(x["id"], None)
+    except Exception as exc:
+        log.warning("Saving tuning to Spoolman failed: %s", exc)
+        return {"ok": False, "error": _sm_err(exc)}
+    log.info("Saved %d tuning values to Spoolman", len(items))
+    return {"ok": True, "n": len(items)}
 
 
 def new_spools() -> list[dict]:
@@ -6881,6 +7129,11 @@ EDITOR_CSS = """
   #pc .dsp { display: flex; gap: 12px; align-items: center; padding: 10px 12px; border: 1px solid var(--orca-border); border-radius: 10px; }
   #pc .dsp .d { width: 34px; height: 34px; border-radius: 50%; flex-shrink: 0; }
   #pc .dsp small { display: block; color: var(--orca-muted); font-size: 11.5px; }
+  #pc .tls { display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow: auto; }
+  #pc .tls .dsp .d { width: 24px; height: 24px; }
+  #pc .tls small b { color: var(--orca-fg); }
+  #pc .tfo { display: flex; align-items: center; gap: 12px; }
+  #pc .tfo span { color: var(--orca-muted); font-size: 12px; }
   #pc .dcard p { margin: 12px 0; color: color-mix(in srgb, var(--orca-fg) 82%, var(--orca-bg)); }
   #pc .dtag { display: flex; flex-direction: column; gap: 4px; padding: 9px 12px; border-radius: 8px; background: color-mix(in srgb, var(--orca-fg) 5%, transparent); margin-bottom: 16px; }
   #pc .dtag span { font-size: 11px; color: var(--orca-muted); font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
@@ -6900,7 +7153,7 @@ EDITOR_CSS = """
 # The Add Spool / Edit Spool card and the New Spool Detected pop-up.
 EDITOR_JS = r"""
   var D = null, spools = [], canEdit = false, seen = {}, cat = { q: null, items: [], busy: false }, ct;
-  var mode, step, S, M, src, q, pick, unlock, ams, cur, ask, used, busy, err, auto, raw0;
+  var mode, step, S, M, src, q, pick, unlock, ams, cur, ask, used, busy, err, auto, raw0, tg, tmsg, tseen = {};
   var RF = '<div class="spool-rfid"><span>RFID</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="5" cy="19" r="1.8" fill="currentColor" stroke="none"></circle><path d="M5,14 A5,5 0 0 1 10,19"></path><path d="M5,10.5 A8.5,8.5 0 0 1 13.5,19"></path><path d="M5,7 A12,12 0 0 1 17,19"></path></svg></div>';
   var esc = function (s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); };
   var nv = function (a, b) { return a == null || a === "" ? (b == null ? "" : b) : a; };
@@ -6913,6 +7166,29 @@ EDITOR_JS = r"""
     add: [["fil", "Filament", "🧵"], ["amt", "Amount", "⚖️"], ["sto", "Storage", "📍"], ["tag", "RFID & Extras", "🏷️"], ["rev", "Review", "✅"]],
     edit: [["amt", "Amount", "⚖️"], ["sto", "Storage", "📍"], ["tag", "RFID & Extras", "🏷️"], ["fil", "Filament", "🧵"], ["rev", "Review", "✅"]]
   };
+  var TX = { flow: "flow_ratio", pa: "pressure_advance", mvs: "max_volumetric_speed", rlen: "retraction_length", rspd: "retraction_speed" };
+  var TS = { flow: "Flow", pa: "PA", mvs: "Max Speed", rlen: "Retract", rspd: "Retract Speed" };
+  var tks = function () { return D && D.tune && D.tune.on ? D.tune.keys : []; };
+  var perSp = function () { return !!(D && D.tune && D.tune.per === "spool"); };
+  var tset = function () { return perSp() && tg === "spool" ? "ts" : "tf"; };
+  var tblank = function () { var o = { by: {} }; Object.keys(TX).forEach(function (k) { o[k] = ""; }); return o; };
+  function tv(ex) {
+    ex = ex || {};
+    var o = { by: {} }, by = dec(dec(ex.pressure_advance_printers));
+    Object.keys(TX).forEach(function (k) { var v = dec(dec(ex[TX[k]])); o[k] = typeof v === "number" ? v : ""; });
+    if (by && typeof by === "object") Object.keys(by).forEach(function (p) { if (typeof by[p] === "number") o.by[p] = by[p]; });
+    return o;
+  }
+  function tfrom(t) {
+    var o = tblank();
+    if (t) { Object.keys(TX).forEach(function (k) { o[k] = t[k] == null ? "" : t[k]; }); Object.keys(t.by || {}).forEach(function (p) { o.by[p] = t.by[p]; }); }
+    return o;
+  }
+  function steps() {
+    var s = STEPS[mode].slice();
+    if (tks().length) s.splice(s.map(function (x) { return x[0]; }).indexOf("tag") + 1, 0, ["tune", "Tuning", "🎛️"]);
+    return s;
+  }
   document.body.insertAdjacentHTML("beforeend", '<div id="pc" hidden></div><div id="pt" hidden></div>');
   var pc = document.getElementById("pc"), pt = document.getElementById("pt"), tt;
   function toast(t) { clearTimeout(tt); pt.innerHTML = t; pt.hidden = false; tt = setTimeout(function () { pt.hidden = true; }, 4000); }
@@ -6931,7 +7207,8 @@ EDITOR_JS = r"""
   var cnt = function (fid) { return spools.filter(function (s) { return (s.filament || {}).id === fid; }).length; };
   function blank() {
     return { fid: null, ext_id: "", name: "", vendor: "", material: "", color_hex: "", diameter: 1.75, density: 1.24, ext: "", bed: "",
-      initial_weight: 1000, spool_weight: 250, remaining_weight: 1000, location: "", lot_nr: "", price: "", comment: "", tag: "", extra: {} };
+      initial_weight: 1000, spool_weight: 250, remaining_weight: 1000, location: "", lot_nr: "", price: "", comment: "", tag: "", extra: {},
+      tf: tblank(), ts: tblank(), tf0: tblank() };
   }
   function fillX() {
     fields().forEach(function (f) {
@@ -6951,10 +7228,11 @@ EDITOR_JS = r"""
     if (!used) S.remaining_weight = S.initial_weight;
     if (ams) S.remaining_weight = ams.pct == null ? S.initial_weight : Math.round(S.initial_weight * ams.pct / 100);
     pick = how + ":" + (how === "mine" ? f.id : how === "cat" ? f.x : f.n);
+    S.tf = tfrom(how === "mine" ? f.t : null); S.tf0 = tfrom(how === "mine" ? f.t : null);
   }
   function load() { orca.postMessage({ type: "editor" }); }
   function find(qq) { cat.busy = true; cat.q = qq; orca.postMessage({ type: "catalogue", q: qq }); }
-  function reset() { step = 0; ask = ""; busy = false; err = ""; auto = null; ams = null; q = ""; pick = ""; raw0 = {}; }
+  function reset() { step = 0; ask = ""; busy = false; err = ""; auto = null; ams = null; q = ""; pick = ""; raw0 = {}; tg = "fil"; tmsg = ""; }
   function openAdd() { reset(); mode = "add"; S = blank(); M = null; src = "mine"; unlock = true; used = false; cur = null; fillX(); load(); draw(); }
   function openEdit(s) {
     reset();
@@ -6964,7 +7242,7 @@ EDITOR_JS = r"""
       diameter: nv(f.diameter), density: nv(f.density), ext: nv(f.settings_extruder_temp), bed: nv(f.settings_bed_temp),
       initial_weight: nv(s.initial_weight, f.weight), spool_weight: nv(s.spool_weight, f.spool_weight), remaining_weight: nv(s.remaining_weight),
       location: s.location || "", lot_nr: s.lot_nr || "", price: nv(s.price), comment: s.comment || "",
-      tag: String(nv(dec(raw0.tag))), extra: {}, use: D ? (D.use[s.id] || []).slice() : null };
+      tag: String(nv(dec(raw0.tag))), extra: {}, use: D ? (D.use[s.id] || []).slice() : null, tf: tv(f.extra), ts: tv(s.extra) };
     M = JSON.parse(JSON.stringify(S)); fillX(); load(); draw();
   }
   window.__spoolioEdit = function (s) { if (s) openEdit(s); else openAdd(); };
@@ -6988,14 +7266,29 @@ EDITOR_JS = r"""
     var d = [];
     Object.keys(LBL).forEach(function (k) { if (!same(S[k], M[k])) d.push({ k: k, l: LBL[k], o: fmt(k, M[k]), n: fmt(k, S[k]), fil: FILK.indexOf(k) >= 0 }); });
     fields().forEach(function (f) { if (!same(S.extra[f.key], M.extra[f.key])) d.push({ k: "x:" + f.key, l: f.name, o: fmt("", M.extra[f.key]), n: fmt("", S.extra[f.key]) }); });
+    (perSp() ? ["tf", "ts"] : ["tf"]).forEach(function (w) {
+      var a = S[w], b = M[w], tl = w === "ts" ? " (This Spool)" : "";
+      tks().forEach(function (t) {
+        if (!same(a[t.k], b[t.k])) d.push({ k: "t:" + w + ":" + t.k, l: t.l + tl, o: fmt("", b[t.k]), n: fmt("", a[t.k]), fil: w === "tf" });
+        if (t.k !== "pa") return;
+        var ps = Object.keys(a.by).concat(Object.keys(b.by).filter(function (p) { return !(p in a.by); }));
+        ps.forEach(function (p) { if (!same(a.by[p], b.by[p])) d.push({ k: "t:" + w + ":by:" + p, l: "Pressure Advance on " + p + tl, o: fmt("", b.by[p]), n: fmt("", a.by[p]), fil: w === "tf" }); });
+      });
+    });
     return d;
   }
-  var chgStep = function (id) { var ks = STEPK[id] || []; return diffs().some(function (x) { return ks.indexOf(x.k) >= 0 || (id === "tag" && x.k.indexOf("x:") === 0); }); };
+  var chgStep = function (id) { var ks = STEPK[id] || []; return diffs().some(function (x) { return ks.indexOf(x.k) >= 0 || (id === "tag" && x.k.indexOf("x:") === 0) || (id === "tune" && x.k.indexOf("t:") === 0); }); };
   function sum(id) {
     if (id === "fil") return S.name ? S.name : "Not Chosen Yet";
     if (id === "amt") return g(S.remaining_weight) + " Left";
     if (id === "sto") return S.location || "No Location";
     if (id === "tag") return S.tag ? "Tag " + S.tag.slice(0, 8) + "…" : "No Tag";
+    if (id === "tune") {
+      var o = S[perSp() && tg === "spool" ? "ts" : "tf"], a = tks().filter(function (t) { return o[t.k] !== ""; }).map(function (t) { return TS[t.k] + " " + o[t.k]; });
+      var nb = Object.keys(o.by).length;
+      if (nb) a.push(plural(nb, "Printer PA"));
+      return a.length ? a.slice(0, 2).join(" · ") + (a.length > 2 ? " +" + (a.length - 2) : "") : "Not Set";
+    }
     if (id === "rev") return mode === "edit" ? (diffs().length ? diffs().length + " to Save" : "No Changes") : "Check and Add";
   }
   var ok = function (id) { return id !== "fil" || !!String(S.name).trim(); };
@@ -7100,6 +7393,31 @@ EDITOR_JS = r"""
       '<div class="sep"></div><div class="xh">Your Spoolman Extra Fields</div>' +
       (!D ? '<div class="note">Loading…</div>' : xs.length ? '<div class="f2">' + xs.map(xf).join("") + '</div>' : '<div class="note">No Extra Fields Set Up in Spoolman.</div>');
   }
+  function tinp(w, k, l, u, ph) {
+    var o = S[w], by = k.indexOf("by:") === 0, v = by ? o.by[k.slice(3)] : o[k], m0 = M ? (by ? M[w].by[k.slice(3)] : M[w][k]) : null;
+    var ch = M && !same(v, m0);
+    return '<div class="' + (ch ? "chg" : "") + '"><label class="fl">' + esc(l) + '</label><div class="in"><input data-t="' + esc(k) + '" value="' + esc(v == null ? "" : v) + '"' +
+      (ph !== "" && ph != null ? ' placeholder="' + esc(ph) + '"' : "") + (u ? ' style="padding-right:' + (16 + u.length * 7) + 'px"' : "") + '>' + (u ? '<span class="u">' + esc(u) + '</span>' : "") + '</div></div>';
+  }
+  function pTune() {
+    var w = tset(), sp = w === "ts", f = S.tf, ks = tks(), h = "";
+    if (perSp()) {
+      h += '<label class="fl">Save Values To</label><div class="seg">' + [["fil", S.name || "The Filament"], ["spool", "This Spool Only"]].map(function (x) { return '<button data-tg="' + x[0] + '" class="' + (tg === x[0] ? "on" : "") + '">' + esc(x[1]) + '</button>'; }).join("") + '</div>' +
+        '<div class="note" style="margin:-4px 0 14px">' + (sp ? "These override the filament's values for this spool only. Leave a box empty to use the filament's value." : "Shared by every spool of this filament.") + '</div>';
+    } else {
+      h += '<div class="note" style="margin:0 0 14px">Saved to the filament, so every spool of it shares them. To set values per spool, choose one preset per spool in Settings.</div>';
+    }
+    var ph = function (k) { return sp ? (k.indexOf("by:") === 0 ? nv(f.by[k.slice(3)], nv(S.ts.pa, f.pa)) : f[k]) : ""; };
+    var rest = ks.filter(function (t) { return t.k !== "pa"; }), pa = ks.filter(function (t) { return t.k === "pa"; })[0];
+    if (rest.length) h += '<div class="f3">' + rest.map(function (t) { return tinp(w, t.k, t.l, t.u, ph(t.k)); }).join("") + '</div>';
+    if (pa) {
+      h += (rest.length ? '<div class="sep"></div>' : "") + '<div class="xh">Pressure Advance</div><div class="f3">' + tinp(w, "pa", "All Printers", "", ph("pa")) +
+        (D.tune.printers || []).map(function (p) { return tinp(w, "by:" + p, p, "", ph("by:" + p) !== "" ? ph("by:" + p) : "Same as All"); }).join("") + '</div>' +
+        '<div class="note">A printer value is used on that printer instead of All Printers.</div>';
+    }
+    h += '<div class="sep"></div><div class="tfo"><button class="sb" data-a="tune-orca">Save From OrcaSlicer</button><span>' + esc(tmsg || "Fills these in from the filament preset selected in OrcaSlicer, unsaved changes included.") + '</span></div>';
+    return h;
+  }
   function pRev() {
     var h = '<div class="pv">' + card() + '</div>';
     if (mode === "edit") {
@@ -7111,13 +7429,14 @@ EDITOR_JS = r"""
     var rows = [["Filament", (S.name || "Not Chosen") + (newf && S.name ? " (New in Spoolman)" : ""), 0], ["Manufacturer", S.vendor || "-", 0], ["Remaining", g(S.remaining_weight) + " of " + g(S.initial_weight), 1],
       ["Empty Spool", g(S.spool_weight), 1], ["Location", S.location || "-", 2], ["Lot / Price", (S.lot_nr || "-") + " · " + (S.price !== "" ? S.price + " " + c : "-"), 2], ["RFID Tag", S.tag || "None", 3]];
     if (D && D.use_printers.length) rows.splice(6, 0, ["Use With", useTxt(S.use), 2]);
+    if (tks().length) rows.push(["Tuning", sum("tune") + (perSp() && tg === "spool" ? " (This Spool)" : ""), 4]);
     return h + '<dl class="kv">' + rows.map(function (r) { return '<dt>' + r[0] + '</dt><dd>' + esc(r[1]) + '<a data-go="' + r[2] + '">Change</a></dd>'; }).join("") + '</dl>';
   }
   function draw() {
-    var st = STEPS[mode], id = st[step][0], d = diffs(), n = d.length;
-    var pages = { fil: pFil, amt: pAmt, sto: pSto, tag: pTag, rev: pRev };
+    var st = steps(), id = st[step][0], d = diffs(), n = d.length;
+    var pages = { fil: pFil, amt: pAmt, sto: pSto, tag: pTag, tune: pTune, rev: pRev };
     var lead = { fil: mode === "add" ? "Choose an Existing Filament or Create a New Filament." : "Shared by Every Spool of This Filament.",
-      amt: "How Much Is on the Spool.", sto: "Where It's Kept.", tag: "Tag and Your Spoolman Fields.",
+      amt: "How Much Is on the Spool.", sto: "Where It's Kept.", tag: "Tag and Your Spoolman Fields.", tune: "Your Calibrated Values for OrcaSlicer Presets.",
       rev: mode === "add" ? "Check, Then Add." : "Your Changes." };
     var last = step === st.length - 1, nc = "Save " + n + (n === 1 ? " Change" : " Changes");
     var main = last ? (mode === "add" ? '<button class="sb pri" data-a="save"' + (S.name && !busy ? "" : " disabled") + '>' + (busy ? "Adding…" : "Add Spool to Spoolman") + '</button>'
@@ -7145,7 +7464,7 @@ EDITOR_JS = r"""
   var NUM = ["initial_weight", "spool_weight", "remaining_weight", "price", "diameter", "density", "ext", "bed"];
   function keep(fn) {
     var a = document.activeElement, sel = null, pos = a && a.selectionStart;
-    if (a && a.dataset) { if (a.dataset.k) sel = '[data-k="' + a.dataset.k + '"]'; else if (a.dataset.x) sel = '[data-x="' + a.dataset.x + '"]'; else if (a.dataset.q) sel = '[data-q="1"]'; }
+    if (a && a.dataset) { if (a.dataset.k) sel = '[data-k="' + a.dataset.k + '"]'; else if (a.dataset.x) sel = '[data-x="' + a.dataset.x + '"]'; else if (a.dataset.q) sel = '[data-q="1"]'; else if (a.dataset.t) sel = '[data-t="' + a.dataset.t + '"]'; }
     fn(); draw();
     if (sel) { var b = pc.querySelector(sel); if (b) { b.focus(); try { b.setSelectionRange(pos, pos); } catch (e) {} } }
   }
@@ -7158,6 +7477,10 @@ EDITOR_JS = r"""
         S[d.k] = NUM.indexOf(d.k) >= 0 && t.value !== "" ? num(t.value) : (d.k === "color_hex" ? t.value.replace("#", "").toUpperCase() : t.value);
         if (d.k === "initial_weight" && mode === "add" && !used) S.remaining_weight = S.initial_weight;
         if (mode === "add" && FILK.indexOf(d.k) >= 0 && src === "new") { pick = "new"; S.fid = null; S.ext_id = ""; }
+      }
+      if (d.t) {
+        var o = S[tset()], v = t.value.trim() === "" ? "" : num(t.value);
+        if (d.t.indexOf("by:") === 0) { if (v === "") delete o.by[d.t.slice(3)]; else o.by[d.t.slice(3)] = v; } else o[d.t] = v;
       }
       if (d.x) { var f = fields().filter(function (x) { return x.key === d.x; })[0]; if (f) S.extra[d.x] = xval(f, t.value); }
       if (d.q) { q = t.value; if (src === "cat") { clearTimeout(ct); ct = setTimeout(function () { find(q); draw(); }, 350); } }
@@ -7181,6 +7504,7 @@ EDITOR_JS = r"""
         else if (FILK.indexOf(x.k) >= 0) msg.fil[x.k] = S[x.k];
         else if (x.k === "tag") msg.extra.tag = S.tag.trim();
         else if (x.k === "use") msg.use = S.use;
+        else if (x.k.indexOf("t:") === 0) tput(msg, x.k.slice(2, 4), x.k.slice(5));
         else msg.extra[x.k.slice(2)] = S.extra[x.k.slice(2)];
       });
     } else {
@@ -7194,9 +7518,32 @@ EDITOR_JS = r"""
       fields().forEach(function (f) { var v = S.extra[f.key]; if (v !== "" && v !== false && v != null) msg.extra[f.key] = v; });
       if (S.tag.trim()) msg.extra.tag = S.tag.trim();
       if (S.use && S.use.length) msg.use = S.use;
+      tks().forEach(function (t) {
+        if (!same(S.tf[t.k], S.tf0[t.k])) tput(msg, "tf", t.k);
+        if (perSp() && S.ts[t.k] !== "") tput(msg, "ts", t.k);
+      });
+      if (!same(S.tf.by, S.tf0.by)) tput(msg, "tf", "by:");
+      if (perSp() && Object.keys(S.ts.by).length) tput(msg, "ts", "by:");
     }
     busy = true; err = ""; draw();
     orca.postMessage(msg);
+  }
+  function tput(msg, w, k) {
+    msg.tune = msg.tune || {};
+    var o = msg.tune[w === "ts" ? "spool" : "fil"] = msg.tune[w === "ts" ? "spool" : "fil"] || {};
+    if (k.indexOf("by:") === 0) o.pressure_advance_printers = S[w].by; else o[TX[k]] = S[w][k];
+  }
+  function tunePrompt(items) {
+    items = (items || []).filter(function (x) { return !tseen[x.id]; });
+    if (!items.length) return;
+    items.forEach(function (x) { tseen[x.id] = 1; });
+    pc.innerHTML = '<div class="dcard"><div class="dh"><span class="pulse"></span>New Tuning Values</div><div class="tls">' +
+      items.map(function (x) {
+        return '<div class="dsp"><span class="d" style="background:#' + (x.c || "555555") + '"></span><span><b>' + esc(x.name) + '</b><small>' + esc(x.label) + ': ' +
+          esc(x.old == null ? "Not Set" : x.old) + ' → <b>' + esc(x.new) + '</b> · ' + esc((x.src === "slice" ? "From your slice on " : "Calibrated on ") + x.printer) + '</small></span></div>';
+      }).join("") + '</div><p>Save ' + (items.length === 1 ? "this" : "these") + ' to Spoolman so your presets keep ' + (items.length === 1 ? "it" : "them") + '?</p>' +
+      '<div class="row"><button class="sb ghost" data-a="tune-skip">Not Now</button><button class="sb pri" data-a="tune-save">Update Spoolman</button></div></div>';
+    pc.tune = items.map(function (x) { return x.id; }); pc.det = null; mode = null; pc.dataset.at = ""; pc.hidden = false;
   }
   function saved(r) {
     if (!busy) return;
@@ -7227,7 +7574,7 @@ EDITOR_JS = r"""
   }
   pc.addEventListener("click", function (e) {
     if (e.target === pc) { if (!mode) { pc.hidden = true; return; } return close(); }
-    var t = e.target.closest("[data-a],[data-go],[data-src],[data-pick],[data-used],[data-xb],[data-use]"); if (!t) return;
+    var t = e.target.closest("[data-a],[data-go],[data-src],[data-pick],[data-used],[data-xb],[data-use],[data-tg]"); if (!t) return;
     var d = t.dataset;
     if (d.go != null) { step = +d.go; ask = ""; draw(); pc.querySelector(".body").scrollTop = 0; return; }
     if (d.src) { src = d.src; q = ""; draw(); return; }
@@ -7238,6 +7585,7 @@ EDITOR_JS = r"""
       draw(); return;
     }
     if (d.xb) { S.extra[d.xb] = !S.extra[d.xb]; draw(); return; }
+    if (d.tg) { tg = d.tg; draw(); return; }
     if (d.use != null) {
       var u = (S.use || []).slice(), i = u.indexOf(d.use);
       if (!d.use) u = []; else if (i >= 0) u.splice(i, 1); else u.push(d.use);
@@ -7253,6 +7601,8 @@ EDITOR_JS = r"""
     if (a === "unlock") { unlock = true; draw(); }
     if (a === "det-later") { orca.postMessage({ type: "new_skip", uid: pc.det.uid }); pc.hidden = true; toast("Won't Ask Again for This Spool."); }
     if (a === "det-add") { var n = pc.det; openAdd(); prefill(n); draw(); }
+    if (a === "tune-orca") { tmsg = "Reading OrcaSlicer…"; draw(); orca.postMessage({ type: "tune_orca" }); }
+    if (a === "tune-skip" || a === "tune-save") { orca.postMessage({ type: "tune_apply", ids: pc.tune, save: a === "tune-save" }); pc.hidden = true; pc.innerHTML = ""; }
   });
   document.addEventListener("keydown", function (e) {
     if (e.key !== "Escape" || pc.hidden) return;
@@ -7279,9 +7629,26 @@ EDITOR_JS = r"""
       if (mode === "add") draw();
     } else if (m.type === "spool_saved") {
       saved(m);
-    } else if (m.type === "live" && canEdit && Array.isArray(m["new"]) && pc.hidden) {
-      var n = m["new"].filter(function (x) { return !seen[x.uid]; })[0];
-      if (n && !document.getElementById("view-main").classList.contains("view-hidden")) det(n);
+    } else if (m.type === "live" && pc.hidden && !document.getElementById("view-main").classList.contains("view-hidden")) {
+      var n = canEdit && Array.isArray(m["new"]) ? m["new"].filter(function (x) { return !seen[x.uid]; })[0] : null;
+      if (n) det(n); else if (Array.isArray(m.tune)) tunePrompt(m.tune);
+    } else if (m.type === "tune" && pc.hidden) {
+      tunePrompt(m.items);
+    } else if (m.type === "tune_orca" && mode) {
+      if (!m.ok) tmsg = m.error || "Couldn't read OrcaSlicer.";
+      else {
+        var o = S[tset()], ps = D.tune.printers || [];
+        tks().forEach(function (t) {
+          var v = m.vals[t.k];
+          if (v == null) return;
+          if (t.k === "pa" && m.printer && ps.indexOf(m.printer) >= 0) o.by[m.printer] = v; else o[t.k] = v;
+        });
+        tmsg = "Filled in from " + m.preset + (m.printer ? " on " + m.printer : "") + ". Check them, then save.";
+      }
+      if (steps()[step] && steps()[step][0] === "tune") draw();
+    } else if (m.type === "tune_done") {
+      if (!m.ok) toast("Couldn't Update Spoolman: " + esc(m.error || ""));
+      else toast(m.save ? '<b>✓</b> Saved ' + plural(m.n || 0, "Value") + ' to Spoolman.' : "Won't Ask Again for These Values.");
     }
   });
 """
@@ -7713,7 +8080,13 @@ PRESET_HTML = """<div class="srow" id="pm-card"><h3><span class="emoji">🧩</sp
     <div class="field-label">Base each preset on:</div>
     <div class="seg"><label><input type="radio" name="pm-base" value="auto">Printer's Own Preset</label><label><input type="radio" name="pm-base" value="pick">Choose Per Material</label></div>
     <div id="pm-mats"></div>
-    <div class="hint">Flow, retraction and other settings Spoolman doesn't hold come from the printer's own preset for that material, or Generic if it has none.</div>
+    <div class="hint">Anything not taken from Spoolman comes from the printer's own preset for that material, or Generic if it has none.</div>
+    <div class="field-label">Take these from Spoolman:</div>
+    <div class="pm-ck"><label class="check-row"><input type="checkbox" data-take="colour">Colour</label><label class="check-row"><input type="checkbox" data-take="temps">Nozzle and Bed Temperatures</label><label class="check-row"><input type="checkbox" data-take="dens">Density and Diameter</label><label class="check-row"><input type="checkbox" data-take="cost">Cost</label></div>
+    <label class="check-row pm-tn"><input id="pm-tune" type="checkbox">Use Advanced Tuning From Spoolman</label>
+    <div class="hint">Adds a Tuning step to Edit Spool for your calibrated values, and offers to update Spoolman when a slice or your AMS uses new ones. Spoolio creates the Spoolman fields it needs.</div>
+    <div class="pm-ck" id="pm-tks"><label class="check-row"><input type="checkbox" data-tk="flow">Flow Ratio</label><label class="check-row"><input type="checkbox" data-tk="pa">Pressure Advance</label><label class="check-row"><input type="checkbox" data-tk="mvs">Max Volumetric Speed</label><label class="check-row"><input type="checkbox" data-tk="rlen">Retraction Length</label><label class="check-row"><input type="checkbox" data-tk="rspd">Retraction Speed</label></div>
+    <div class="hint" id="pm-tkh">Anything you leave blank in Spoolman comes from the base preset.</div>
     <div class="pm-sync" id="pm-sync"><span class="pm-dot"></span><span id="pm-st"></span><button type="button" class="pm-btn" id="pm-now">Sync Now</button></div>
   </div>
   <div class="hint warn" id="pm-warn" hidden><strong>!</strong> <span id="pm-wt"></span></div>
@@ -7749,6 +8122,10 @@ PRESET_CSS = """
   #pm-card .pm-tb td:first-child { color: var(--orca-muted); width: 45%; }
   #pm-card .pm-l { margin-top: 14px; }
   #pm-card .pm-note { font-size: 12px; color: var(--orca-muted); border: 1px dashed var(--orca-border); border-radius: 8px; padding: 14px; }
+  #pm-card .pm-ck { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 2px 12px; margin-top: 6px; }
+  #pm-card .pm-ck .check-row { margin: 4px 0; }
+  #pm-card .pm-tn { margin: 14px 0 0; }
+  #pm-card.pm-tnoff #pm-tks, #pm-card.pm-tnoff #pm-tkh { display: none; }
   #pm-card.pm-off #pm-opts { opacity: .45; pointer-events: none; }
   #pm-card.pm-off .pm-sync { display: none; }
   #pm-card.pm-na .srow-body > .srow-l > *:not(#pm-warn):not(.check-row), #pm-card.pm-na #pm-opts { opacity: .45; pointer-events: none; }
@@ -7769,7 +8146,11 @@ PRESET_JS = r"""
     var pr = {}, bs = Object.assign({}, C ? C.bases : {});
     document.querySelectorAll("#pm-prs [data-p]").forEach(function (r) { pr[r.dataset.p] = { on: r.querySelector("input").checked, group: r.querySelector("select").value }; });
     document.querySelectorAll("#pm-mats select").forEach(function (s) { if (s.value) bs[s.dataset.m] = s.value; else delete bs[s.dataset.m]; });
-    return { on: $("pm-on").checked, per: radio("pm-per") || "filament", base: radio("pm-base") || "auto", printers: pr, bases: bs };
+    var tk = {}, tn = {};
+    document.querySelectorAll("#pm-card [data-take]").forEach(function (x) { tk[x.dataset.take] = x.checked; });
+    document.querySelectorAll("#pm-card [data-tk]").forEach(function (x) { tn[x.dataset.tk] = x.checked; });
+    return { on: $("pm-on").checked, per: radio("pm-per") || "filament", base: radio("pm-base") || "auto", printers: pr, bases: bs,
+      take: tk, tune: { on: $("pm-tune").checked, keys: tn } };
   }
   function spoolman() { var x = document.querySelector('input[name="spool-source"]:checked'); return !x || x.value === "spoolman"; }
   function look() {
@@ -7777,6 +8158,7 @@ PRESET_JS = r"""
     var na = !I || !I.api || !spoolman();
     card.classList.toggle("pm-na", na);
     card.classList.toggle("pm-off", !$("pm-on").checked);
+    card.classList.toggle("pm-tnoff", !$("pm-tune").checked);
     $("pm-wt").textContent = I && !I.api ? "This version of OrcaSlicer can't add presets." : !spoolman() ? "Only available with Spoolman as your spool source." : "";
     $("pm-warn").hidden = !$("pm-wt").textContent;
   }
@@ -7811,7 +8193,11 @@ PRESET_JS = r"""
   }
   function draw(d, full) {
     I = d; C = d.cfg;
-    if (full) { $("pm-on").checked = C.on; setRadio("pm-per", C.per); setRadio("pm-base", C.base); }
+    if (full) {
+      $("pm-on").checked = C.on; setRadio("pm-per", C.per); setRadio("pm-base", C.base); $("pm-tune").checked = C.tune.on;
+      document.querySelectorAll("#pm-card [data-take]").forEach(function (x) { x.checked = C.take[x.dataset.take] !== false; });
+      document.querySelectorAll("#pm-card [data-tk]").forEach(function (x) { x.checked = !!C.tune.keys[x.dataset.tk]; });
+    }
     var opts = function (g) { return '<option value="">Choose a Printer Preset</option>' + d.groups.map(function (x) { return '<option' + (x === g ? " selected" : "") + '>' + esc(x) + '</option>'; }).join(""); };
     $("pm-prs").innerHTML = d.printers.length ? d.printers.map(function (p) {
       return '<div class="pm-pr" data-p="' + esc(p.id) + '"><label class="check-row"><input type="checkbox"' + (p.on ? " checked" : "") + '>' + esc(p.name) + '</label><select>' + opts(p.group) + '</select></div>' +
@@ -7987,7 +8373,8 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
             elif msg_type == "heads_bind" and _sliced["slots"]:
                 _bg(run_heads, _sliced["slots"], _sliced["preset"], str(data.get("id") or ""))
             elif msg_type == "live":
-                self.post_message({"type": "live", "live": live_poll(), "usage": usage_state(), "new": new_spools()})
+                self.post_message({"type": "live", "live": live_poll(), "usage": usage_state(), "new": new_spools(),
+                                   "tune": tune_items()})
             elif msg_type == "editor":
                 _bg(lambda: self.post_message({"type": "editor", **editor_data()}))
             elif msg_type == "catalogue":
@@ -7996,6 +8383,10 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
                 _bg(self._spool_save, data)
             elif msg_type == "new_skip":
                 new_skip(data.get("uid"))
+            elif msg_type == "tune_orca":
+                _bg(lambda: self.post_message({"type": "tune_orca", **tune_orca()}))
+            elif msg_type == "tune_apply":
+                _bg(self._tune_apply, data)
             elif msg_type == "printer_code":
                 save_printer_code(data.get("id"), data.get("code"))
             elif msg_type == "printer_test":
@@ -8013,6 +8404,13 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
 
     def _spoolman_url(self):
         return cfg().get("spoolman_url", "")
+
+    def _tune_apply(self, data):
+        save = data.get("save") is True
+        result = tune_apply(data.get("ids"), save)
+        self.post_message({"type": "tune_done", "save": save, **result})
+        if save and result["ok"]:
+            self._push_data()
 
     def _spool_save(self, data):
         result = spool_save(data)
@@ -8224,6 +8622,10 @@ if _SLICING:
                 enabled, margin = plate_settings()
                 slots = plate_slots(ctx, parse_usage(read_tail(ctx.gcode_path)))
                 usage_plan(slots)
+                try:
+                    tune_check(ctx)
+                except Exception:
+                    log.exception("Tuning check failed")
                 _bg(run_heads, slots, str(ctx.config_value("printer_settings_id") or ""))
                 if enabled:
                     if any(slot["grams"] > 0 for slot in slots):
