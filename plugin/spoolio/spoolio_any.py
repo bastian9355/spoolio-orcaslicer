@@ -2393,7 +2393,14 @@ def editor_data() -> dict:
                         "multi": bool(f.get("multi_choice"))})
     return {"ok": True, "fields": out, "cur": CUR_SIGNS.get(code, code),
             "vendors": sorted({v.get("name") for v in vendors if isinstance(v, dict) and v.get("name")}, key=str.lower),
-            "filaments": [_fil(f) for f in fils if isinstance(f, dict) and not f.get("archived")]}
+            "filaments": [_fil(f) for f in fils if isinstance(f, dict) and not f.get("archived")], **_use_data()}
+
+
+def _use_data() -> dict:
+    """The printers a spool's presets can be limited to, when OrcaSlicer presets are on."""
+    c = parse_presets(cfg().get("presets"))
+    prs = [{"id": p["id"], "name": p["name"]} for p in printers_cfg() if c["printers"].get(p["id"], {}).get("on")]
+    return {"use_printers": prs if c["on"] else [], "use": c["use"]}
 
 
 def catalogue(query: object) -> dict:
@@ -2492,6 +2499,15 @@ def spool_save(d: dict) -> dict:
     except Exception as exc:
         log.warning("Saving a spool to Spoolman failed: %s", exc)
         return {"ok": False, "error": _sm_err(exc)}
+    if isinstance(d.get("use"), list):
+        ids = [str(i)[:32] for i in d["use"][:8]]
+
+        def put(s):
+            c = s["presets"] = parse_presets(s.get("presets"))
+            c["use"].pop(str(sid), None)
+            if ids:
+                c["use"][str(sid)] = ids
+        cfg_edit(put)
     _spool_cache["time"] = 0.0
     log.info("Spool #%s %s in Spoolman%s", sid, "saved" if d.get("id") else "added", " (new filament)" if made else "")
     return {"ok": True, "id": sid, "made": made, "added": not d.get("id")}
@@ -2511,6 +2527,327 @@ def _where(unit_id: int, slot: int) -> str:
     if unit_id >= 128:
         return f"AMS HT {unit_id - 127}"
     return f"AMS {unit_id + 1} · Slot {slot + 1}"
+
+
+PRESET_ID = "spoolio"
+NOZZLE_RE = re.compile(r"\s*[(\-]?\s*\d+(?:\.\d+)?\s*(?:mm\s*)?nozzle\)?", re.I)
+_pst: dict = {"n": 0, "time": "", "err": ""}
+_psync = threading.Lock()
+
+
+def parse_presets(value: object) -> dict:
+    v = value if isinstance(value, dict) else {}
+    pr = v.get("printers") if isinstance(v.get("printers"), dict) else {}
+    bs = v.get("bases") if isinstance(v.get("bases"), dict) else {}
+    us = v.get("use") if isinstance(v.get("use"), dict) else {}
+    return {"on": parse_flag(v.get("on"), default=False),
+            "per": "spool" if v.get("per") == "spool" else "filament",
+            "base": "pick" if v.get("base") == "pick" else "auto",
+            "printers": {str(k)[:32]: {"on": parse_flag(x.get("on"), default=False),
+                                       "group": str(x.get("group") or "")[:120]}
+                         for k, x in list(pr.items())[:8] if isinstance(x, dict)},
+            "bases": {str(k)[:24]: str(x)[:120] for k, x in list(bs.items())[:40] if isinstance(x, str)},
+            "use": {str(k)[:16]: [str(i)[:32] for i in x[:8]] for k, x in list(us.items())[-500:]
+                    if isinstance(x, list) and x}}
+
+
+def _papi():
+    """OrcaSlicer's preset bundle and local bundle reload, or None before OrcaSlicer 2.5.0."""
+    h = getattr(orca, "host", None)
+    pb = getattr(h, "preset_bundle", None)
+    rl = getattr(getattr(getattr(h, "preset", None), "bundles", None), "reload_local", None)
+    return (pb(), rl) if callable(pb) and callable(rl) else None
+
+
+def _strs(v: object) -> list[str]:
+    """A serialized string-list setting, like '"PLA";"PETG"', as a list."""
+    if v is None:
+        return []
+    out = []
+    for m in re.findall(r'"((?:[^"\\]|\\.)*)"|([^;]+)', str(v)):
+        x = (m[0] or m[1]).strip()
+        if x:
+            out.append(x)
+    return out
+
+
+def _all(c) -> list:
+    return [c.preset(i) for i in range(c.size())]
+
+
+def _groups(pb) -> dict[str, list[str]]:
+    """Printer presets by printer, each with its nozzle sizes, 0.4 first."""
+    g: dict[str, list[str]] = {}
+    for p in _all(pb.printers):
+        if not p.is_default and p.is_visible:
+            g.setdefault(NOZZLE_RE.sub("", p.name).strip() or p.name, []).append(p.name)
+    return {k: sorted(v, key=lambda n: ("0.4" not in n, n)) for k, v in sorted(g.items())}
+
+
+def _pk(s: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(s or "").lower().replace("carbon", "c"))
+
+
+def _guess(p: dict, groups: dict) -> str:
+    if p.get("orca"):
+        for k, names in groups.items():
+            if p["orca"] in names:
+                return k
+    toks = [_pk(t) for t in re.split(r"[\s\-_/]+", p.get("name") or "") if re.search(r"\d", t)]
+    hits = [k for k in groups if toks and all(t in _pk(k) for t in toks)]
+    return min(hits, key=len) if hits else ""
+
+
+def _pdir(pb) -> Path:
+    root = DATA_DIR.parent / "user"
+    for c in (pb.filaments, pb.printers, pb.prints):
+        for p in _all(c):
+            try:
+                parts = Path(p.file or "").resolve().relative_to(root.resolve()).parts
+            except (ValueError, OSError):
+                continue
+            if len(parts) > 1 and not parts[0].startswith("_"):
+                return root / parts[0] / "_local" / PRESET_ID
+    return root / "default" / "_local" / PRESET_ID
+
+
+_bcache: dict = {"n": -1, "v": []}
+
+
+def _bases(pb) -> list[dict]:
+    if _bcache["n"] == pb.filaments.size():
+        return _bcache["v"]
+    out = []
+    for p in _all(pb.filaments):
+        if not p.is_system or p.is_default or p.name.startswith("fdm_"):
+            continue
+        t = _strs(p.config_value("filament_type"))
+        v = _strs(p.config_value("filament_vendor"))
+        out.append({"n": p.name, "t": t[0].upper() if t else "", "v": v[0].lower() if v else "",
+                    "cp": set(_strs(p.config_value("compatible_printers")))})
+    _bcache.update(n=pb.filaments.size(), v=out)
+    return out
+
+
+def _base(bases: list[dict], f: dict, names: list[str], pick: str = "") -> str:
+    mat = str(f.get("material") or "").upper()
+    ven = str((f.get("vendor") or {}).get("name") or "").lower()
+    words = [w for w in re.findall(r"[a-z+]{3,}", str(f.get("name") or "").lower()) if w != mat.lower()]
+    best, top = "", None
+    for b in bases:
+        if b["t"] != mat or (b["cp"] and not b["cp"] & set(names)):
+            continue
+        if pick:
+            if b["n"].split("@")[0].strip() == pick:
+                return b["n"]
+            continue
+        s = (4 if b["cp"] else 0) + (3 if ven and b["v"] == ven else 0) + ("generic" in b["n"].lower())
+        s += sum(w in b["n"].lower() for w in words)
+        if top is None or (s, -len(b["n"])) > top:
+            best, top = b["n"], (s, -len(b["n"]))
+    return best if best or not pick else _base(bases, f, names)
+
+
+def _kg_cost(sp: dict, f: dict):
+    for price, w in ((sp.get("price"), sp.get("initial_weight")), (f.get("price"), f.get("weight"))):
+        p, g = _num_or(price), _num_or(w)
+        if p and g:
+            return round(p / g * 1000, 2)
+    return None
+
+
+def _pfile(name: str) -> str:
+    return re.sub(r'[\\/:*?"<>|]', "-", name).strip(" .") + ".json"
+
+
+def _loaded(spools: list) -> dict[str, set]:
+    """Spool id to the printers it's loaded in, from the Printer tab and Live Link's RFID trays."""
+    out: dict[str, set] = {}
+    for p in printers_cfg():
+        for u in p["units"]:
+            for x in u["slots"]:
+                if x:
+                    out.setdefault(str(x), set()).add(p["id"])
+    tags = {t: str(sp.get("id")) for sp in spools if isinstance(sp, dict) for t in spool_tags(sp)}
+    if tags:
+        with _live_lock:
+            for st in _live["printers"].values():
+                if st.get("kind") == "net":
+                    continue
+                trays = [t for u in st["units"].values() for t in u.values()] + ([st["ext"]] if st["ext"] else [])
+                for t in trays:
+                    for i in _tag_ids(t.get("tray_uuid")):
+                        if i in tags and st.get("link"):
+                            out.setdefault(tags[i], set()).add(st["link"])
+    return out
+
+
+def build_presets(c: dict, spools: list, pb, only: str = "") -> list[dict]:
+    """The presets for the ticked printers: one per filament, or per spool."""
+    groups = _groups(pb)
+    prs = [(p, groups[c["printers"][p["id"]]["group"]]) for p in printers_cfg()
+           if c["printers"].get(p["id"], {}).get("on") and c["printers"][p["id"]]["group"] in groups
+           and (not only or p["id"] == only)]
+    live = [sp for sp in spools if isinstance(sp, dict) and isinstance(sp.get("filament"), dict)
+            and not sp.get("archived") and (_num_or(sp.get("remaining_weight"), 1) or 0) > 0]
+    picks: dict = {}
+    loaded = _loaded(live)
+    want: dict = {}
+    for sp in sorted(live, key=lambda x: x.get("id") or 0):
+        key = sp["id"] if c["per"] == "spool" else sp["filament"].get("id")
+        picks.setdefault(key, sp)
+        w = set(c["use"].get(str(sp["id"])) or []) or loaded.get(str(sp["id"]))
+        if w:
+            want.setdefault(key, set()).update(w)
+    names: dict = {}
+    for sp in picks.values():
+        f = sp["filament"]
+        n = str(f.get("name") or f.get("material") or "Filament").strip()
+        names.setdefault(n, []).append(sp)
+    label = {}
+    for n, sps in names.items():
+        for sp in sps:
+            f = sp["filament"]
+            x = n
+            if len(sps) > 1 and c["per"] == "filament":
+                vn = (f.get("vendor") or {}).get("name")
+                x = f"{n} ({vn})" if vn and sum((s["filament"].get("vendor") or {}).get("name") == vn for s in sps) == 1 \
+                    else f"{n} #{f.get('id')}"
+            label[id(sp)] = f"{x} #{sp['id']}" if c["per"] == "spool" else x
+    bases = _bases(pb) if prs else []
+    out = []
+    for p, nz in prs:
+        for key, sp in picks.items():
+            if key in want and p["id"] not in want[key]:
+                continue
+            f = sp["filament"]
+            name = f"{label[id(sp)]} @ {p['name']}"
+            base = _base(bases, f, nz, c["bases"].get(str(f.get("material") or "").upper(), "") if c["base"] == "pick" else "")
+            if not base:
+                continue
+            d = {"type": "filament", "name": name, "from": "User", "instantiation": "true", "inherits": base,
+                 "filament_settings_id": [name], "compatible_printers": nz, "compatible_printers_condition": ""}
+            hx = _first_hex(f)
+            if hx:
+                d["filament_colour"] = ["#" + hx.upper()]
+            ven = (f.get("vendor") or {}).get("name")
+            if ven:
+                d["filament_vendor"] = [ven]
+            for k, keys in (("settings_extruder_temp", ("nozzle_temperature", "nozzle_temperature_initial_layer")),
+                            ("settings_bed_temp", ("hot_plate_temp", "hot_plate_temp_initial_layer",
+                                                   "textured_plate_temp", "textured_plate_temp_initial_layer")),
+                            ("density", ("filament_density",)), ("diameter", ("filament_diameter",))):
+                v = _num_or(f.get(k))
+                if v:
+                    d.update({x: [str(v)] for x in keys})
+            cost = _kg_cost(sp, f)
+            if cost:
+                d["filament_cost"] = [str(cost)]
+            out.append({"file": _pfile(name), "json": d, "spool": sp, "printer": p, "cost": cost})
+    return out
+
+
+def presets_sync(spools: list | None = None, force: bool = False) -> dict:
+    """Writes Spoolio's local preset bundle and asks OrcaSlicer to reload it when anything changed."""
+    if not _psync.acquire(blocking=False):
+        return dict(_pst)
+    try:
+        c = parse_presets(cfg().get("presets"))
+        api = _papi()
+        if not api:
+            if c["on"]:
+                _pst.update(err="This version of OrcaSlicer can't add presets.")
+            return dict(_pst)
+        pb, reload = api
+        d = _pdir(pb)
+        fd = d / "filament"
+        if not c["on"] and not fd.is_dir():
+            return dict(_pst)
+        files = {}
+        if c["on"] and source() == "spoolman":
+            if spools is None:
+                url = cfg().get("spoolman_url", "")
+                spools = _spool_cache["spools"] if _spool_cache["url"] == url else get_spools(url).get("spools") or []
+            files = {e["file"]: json.dumps(e["json"], indent=2) + "\n" for e in build_presets(c, spools, pb)}
+        old = {p.name: p.read_text(encoding="utf-8") for p in fd.glob("*.json")} if fd.is_dir() else {}
+        if files == old and not force and not _pst["err"]:
+            return dict(_pst)
+        _write(d / "bundle_metadata.json", json.dumps({"id": PRESET_ID, "name": PLUGIN_NAME, "version": PLUGIN_VERSION}))
+        for name, text in files.items():
+            if old.get(name) != text:
+                _write(fd / name, text)
+        for name in set(old) - set(files):
+            (fd / name).unlink(missing_ok=True)
+        fd.mkdir(parents=True, exist_ok=True)
+        try:
+            reload(PRESET_ID)
+        except Exception as exc:
+            log.warning("OrcaSlicer didn't reload Spoolio's presets: %s", exc)
+            _pst.update(err="OrcaSlicer didn't load the presets yet. Save or discard any filament preset edits, "
+                            "then select Sync Now.")
+            return dict(_pst)
+        log.info("Synced %d OrcaSlicer filament presets", len(files))
+        _pst.update(n=len(files), time=time.strftime("%H:%M"), err="")
+        return dict(_pst)
+    except Exception as exc:
+        log.exception("Preset sync failed")
+        _pst.update(err=f"Preset sync failed: {exc}")
+        return dict(_pst)
+    finally:
+        _psync.release()
+
+
+def presets_info(want: object = None) -> dict:
+    """What the OrcaSlicer Presets card shows, for the saved or the unsaved settings."""
+    saved = parse_presets(cfg().get("presets"))
+    c = parse_presets({**want, "use": saved["use"]}) if isinstance(want, dict) else saved
+    out = {"type": "presets_info", "cfg": c, "api": False, "printers": [], "groups": [], "materials": [],
+           "status": dict(_pst), "sample": None}
+    api = _papi()
+    if not api:
+        return out
+    pb = api[0]
+    groups = _groups(pb)
+    out["api"] = True
+    out["groups"] = list(groups)
+    for p in printers_cfg():
+        s = c["printers"].get(p["id"])
+        g = s["group"] if s and s["group"] in groups else _guess(p, groups)
+        c["printers"][p["id"]] = {"on": bool(s and s["on"]), "group": g}
+        out["printers"].append({"id": p["id"], "name": p["name"], "group": g, "on": bool(s and s["on"]),
+                                "nozzles": groups.get(g, [])})
+    url = cfg().get("spoolman_url", "")
+    spools = _spool_cache["spools"] if _spool_cache["url"] == url and url else []
+    mats = sorted({str(sp["filament"].get("material") or "").upper() for sp in spools
+                   if isinstance(sp.get("filament"), dict) and sp["filament"].get("material")})
+    if c["base"] == "pick" and mats:
+        bases = _bases(pb)
+        for m in mats:
+            opts = sorted({b["n"].split("@")[0].strip() for b in bases if b["t"] == m})[:80]
+            out["materials"].append({"m": m, "opts": opts, "pick": c["bases"].get(m, "")})
+    first = next((p for p in out["printers"] if p["on"] and p["group"]), None)
+    if first and spools:
+        es = build_presets(c, spools, pb, first["id"])
+        if es:
+            e = es[0]
+            sp = dict(e["spool"], rfid_tags=sorted(spool_tags(e["spool"])))
+            j = e["json"]
+            sign = CUR_SIGNS.get(_cur["code"], _cur["code"] + " " if _cur["code"] else "€")
+            rows = [["Colour", (j.get("filament_colour") or ["-"])[0]],
+                    ["Type and Vendor", ", ".join(x for x in (str(e["spool"]["filament"].get("material") or ""),
+                                                              (j.get("filament_vendor") or [""])[0]) if x) or "-"],
+                    ["Nozzle Temperature", f"{j['nozzle_temperature'][0]} °C" if "nozzle_temperature" in j else "From Base Preset"],
+                    ["Bed Temperature", f"{j['hot_plate_temp'][0]} °C" if "hot_plate_temp" in j else "From Base Preset"],
+                    ["Density and Diameter", ", ".join(x for x in (
+                        f"{j['filament_density'][0]} g/cm³" if "filament_density" in j else "",
+                        f"{j['filament_diameter'][0]} mm" if "filament_diameter" in j else "") if x) or "From Base Preset"],
+                    ["Cost", f"{sign}{e['cost']:.2f} per kg" if e["cost"] else "From Base Preset"],
+                    ["Based On", j["inherits"]]]
+            out["sample"] = {"spool": sp, "name": j["name"], "printer": first["name"], "base": j["inherits"],
+                             "colour": (j.get("filament_colour") or [""])[0], "rows": rows,
+                             "list": [{"n": x["json"]["name"], "c": (x["json"].get("filament_colour") or [""])[0]}
+                                      for x in es[:6]], "more": max(0, len(es) - 6)}
+    return out
 
 
 def new_spools() -> list[dict]:
@@ -5171,6 +5508,7 @@ MAIN_PAGE = """
         ? s.initial_weight : filament.weight;
     }
 
+    window.__spoolioCard = function (s) { return spoolRowHtml(s); };
     function spoolRowHtml(s) {
       const filament = s.filament || {};
       const vendor = filament.vendor || {};
@@ -6104,6 +6442,7 @@ SETTINGS_PAGE = """
         progress: progPick(),
         stats: statsPick(),
         appearance: window.__spoolioLook ? window.__spoolioLook() : null,
+        presets: window.__spoolioPresets ? window.__spoolioPresets() : null,
       });
     });
     refreshSave();
@@ -6502,6 +6841,9 @@ EDITOR_CSS = """
   #pc .calc { margin-top: 8px; font-size: 12px; color: var(--orca-muted); }
   #pc .calc b { color: var(--orca-fg); }
   #pc .tg { display: flex; align-items: center; gap: 10px; padding: 7px 0; cursor: pointer; }
+  #pc .ucs { display: flex; flex-wrap: wrap; gap: 6px; }
+  #pc .uc { border: 1px solid var(--orca-border); background: transparent; color: var(--orca-fg); border-radius: 999px; padding: 5px 12px; font: inherit; font-size: 12px; cursor: pointer; }
+  #pc .uc.on { background: var(--orca-accent); border-color: var(--orca-accent); color: var(--orca-accent-fg); font-weight: 600; }
   #pc .tog { width: 36px; height: 20px; border-radius: 10px; background: #55555b; position: relative; flex-shrink: 0; }
   #pc .tog::after { content: ""; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: #e8e8e8; transition: left .15s; }
   #pc .tog.on { background: var(--orca-accent); }
@@ -6622,18 +6964,19 @@ EDITOR_JS = r"""
       diameter: nv(f.diameter), density: nv(f.density), ext: nv(f.settings_extruder_temp), bed: nv(f.settings_bed_temp),
       initial_weight: nv(s.initial_weight, f.weight), spool_weight: nv(s.spool_weight, f.spool_weight), remaining_weight: nv(s.remaining_weight),
       location: s.location || "", lot_nr: s.lot_nr || "", price: nv(s.price), comment: s.comment || "",
-      tag: String(nv(dec(raw0.tag))), extra: {} };
+      tag: String(nv(dec(raw0.tag))), extra: {}, use: D ? (D.use[s.id] || []).slice() : null };
     M = JSON.parse(JSON.stringify(S)); fillX(); load(); draw();
   }
   window.__spoolioEdit = function (s) { if (s) openEdit(s); else openAdd(); };
   var LBL = { name: "Name", vendor: "Manufacturer", material: "Material", color_hex: "Colour", diameter: "Diameter", density: "Density", ext: "Nozzle Temp", bed: "Bed Temp",
-    initial_weight: "Filament Weight", spool_weight: "Empty Spool", remaining_weight: "Remaining", location: "Location", lot_nr: "Lot Number", price: "Price", comment: "Note", tag: "RFID Tag" };
+    initial_weight: "Filament Weight", spool_weight: "Empty Spool", remaining_weight: "Remaining", location: "Location", lot_nr: "Lot Number", price: "Price", comment: "Note", tag: "RFID Tag", use: "Use With" };
   var unit = function (k) { return { initial_weight: " g", spool_weight: " g", remaining_weight: " g", price: " " + (D ? D.cur : "€"), diameter: " mm", density: " g/cm³", ext: " °C", bed: " °C" }[k] || ""; };
   var FILK = ["name", "vendor", "material", "color_hex", "diameter", "density", "ext", "bed"];
   var SPK = ["remaining_weight", "initial_weight", "spool_weight", "location", "lot_nr", "price", "comment"];
-  var STEPK = { amt: ["remaining_weight", "initial_weight", "spool_weight"], sto: ["location", "lot_nr", "price", "comment"], tag: ["tag"], fil: FILK };
+  var STEPK = { amt: ["remaining_weight", "initial_weight", "spool_weight"], sto: ["location", "lot_nr", "price", "comment", "use"], tag: ["tag"], fil: FILK };
   var same = function (a, b) { return JSON.stringify(a == null ? "" : a) === JSON.stringify(b == null ? "" : b) || String(a) === String(b); };
   function fmt(k, v) {
+    if (k === "use") return useTxt(v);
     if (v === "" || v == null || (Array.isArray(v) && !v.join(""))) return "Empty";
     if (k === "color_hex") return "#" + String(v).toUpperCase();
     if (typeof v === "boolean") return v ? "Yes" : "No";
@@ -6716,11 +7059,25 @@ EDITOR_JS = r"""
     h += '<div class="meter"><i style="width:' + Math.max(0, Math.min(100, rem / (ini || 1) * 100)) + '%;background:' + col + '"></i></div><div class="calc"><b>' + g(rem) + '</b> Left of ' + g(ini) + ' · ' + g(ini - rem) + ' Used</div>';
     return h;
   }
+  function useTxt(v) {
+    if (!v || !v.length) return "Automatic";
+    var ps = D ? D.use_printers : [];
+    return v.map(function (i) { var p = ps.filter(function (x) { return x.id === i; })[0]; return p ? p.name : i; }).join(", ");
+  }
+  function pUse() {
+    var ps = D ? D.use_printers : [];
+    if (!ps.length || S.use == null) return "";
+    var c = M && !same(S.use, M.use) ? "chg" : "";
+    var chip = function (id, name, on) { return '<button type="button" class="uc' + (on ? " on" : "") + '" data-use="' + esc(id) + '">' + esc(name) + '</button>'; };
+    return '<div style="margin-top:14px" class="' + c + '"><label class="fl">Use With</label><div class="ucs">' + chip("", "Automatic", !S.use.length) +
+      ps.map(function (p) { return chip(p.id, p.name, S.use.indexOf(p.id) >= 0); }).join("") + '</div>' +
+      '<div class="note">Picks which printers get an OrcaSlicer preset for this spool. Automatic follows the printer it\'s loaded in, or all your printers when it isn\'t loaded.</div></div>';
+  }
   function pSto() {
     var locs = []; spools.forEach(function (x) { if (x.location && locs.indexOf(x.location) < 0) locs.push(x.location); });
     return '<div class="f3">' + inp("location", "", { list: "pc-locs", ph: "e.g. Shelf" }) + inp("lot_nr", "", { ph: "Optional" }) + inp("price", (D ? D.cur : "€"), { ph: "Optional" }) + '</div>' +
       '<datalist id="pc-locs">' + locs.map(function (l) { return '<option value="' + esc(l) + '">'; }).join("") + '</datalist>' +
-      '<div style="margin-top:14px" class="' + (M && !same(S.comment, M.comment) ? "chg" : "") + '"><label class="fl">Note</label><textarea data-k="comment" placeholder="Optional">' + esc(S.comment) + '</textarea></div>';
+      '<div style="margin-top:14px" class="' + (M && !same(S.comment, M.comment) ? "chg" : "") + '"><label class="fl">Note</label><textarea data-k="comment" placeholder="Optional">' + esc(S.comment) + '</textarea></div>' + pUse();
   }
   function xf(f) {
     var val = S.extra[f.key], c = M && !same(val, M.extra[f.key]) ? "chg" : "", lb = '<label class="fl">' + esc(f.name) + '</label>';
@@ -6753,6 +7110,7 @@ EDITOR_JS = r"""
     var newf = pick.indexOf("mine:") !== 0, c = D ? D.cur : "€";
     var rows = [["Filament", (S.name || "Not Chosen") + (newf && S.name ? " (New in Spoolman)" : ""), 0], ["Manufacturer", S.vendor || "-", 0], ["Remaining", g(S.remaining_weight) + " of " + g(S.initial_weight), 1],
       ["Empty Spool", g(S.spool_weight), 1], ["Location", S.location || "-", 2], ["Lot / Price", (S.lot_nr || "-") + " · " + (S.price !== "" ? S.price + " " + c : "-"), 2], ["RFID Tag", S.tag || "None", 3]];
+    if (D && D.use_printers.length) rows.splice(6, 0, ["Use With", useTxt(S.use), 2]);
     return h + '<dl class="kv">' + rows.map(function (r) { return '<dt>' + r[0] + '</dt><dd>' + esc(r[1]) + '<a data-go="' + r[2] + '">Change</a></dd>'; }).join("") + '</dl>';
   }
   function draw() {
@@ -6822,6 +7180,7 @@ EDITOR_JS = r"""
         if (SPK.indexOf(x.k) >= 0) msg.spool[x.k] = S[x.k];
         else if (FILK.indexOf(x.k) >= 0) msg.fil[x.k] = S[x.k];
         else if (x.k === "tag") msg.extra.tag = S.tag.trim();
+        else if (x.k === "use") msg.use = S.use;
         else msg.extra[x.k.slice(2)] = S.extra[x.k.slice(2)];
       });
     } else {
@@ -6834,6 +7193,7 @@ EDITOR_JS = r"""
       SPK.forEach(function (k) { msg.spool[k] = k === "remaining_weight" && !used ? S.initial_weight : S[k]; });
       fields().forEach(function (f) { var v = S.extra[f.key]; if (v !== "" && v !== false && v != null) msg.extra[f.key] = v; });
       if (S.tag.trim()) msg.extra.tag = S.tag.trim();
+      if (S.use && S.use.length) msg.use = S.use;
     }
     busy = true; err = ""; draw();
     orca.postMessage(msg);
@@ -6867,7 +7227,7 @@ EDITOR_JS = r"""
   }
   pc.addEventListener("click", function (e) {
     if (e.target === pc) { if (!mode) { pc.hidden = true; return; } return close(); }
-    var t = e.target.closest("[data-a],[data-go],[data-src],[data-pick],[data-used],[data-xb]"); if (!t) return;
+    var t = e.target.closest("[data-a],[data-go],[data-src],[data-pick],[data-used],[data-xb],[data-use]"); if (!t) return;
     var d = t.dataset;
     if (d.go != null) { step = +d.go; ask = ""; draw(); pc.querySelector(".body").scrollTop = 0; return; }
     if (d.src) { src = d.src; q = ""; draw(); return; }
@@ -6878,6 +7238,11 @@ EDITOR_JS = r"""
       draw(); return;
     }
     if (d.xb) { S.extra[d.xb] = !S.extra[d.xb]; draw(); return; }
+    if (d.use != null) {
+      var u = (S.use || []).slice(), i = u.indexOf(d.use);
+      if (!d.use) u = []; else if (i >= 0) u.splice(i, 1); else u.push(d.use);
+      S.use = u; draw(); return;
+    }
     var a = d.a;
     if (a === "next") { step++; draw(); pc.querySelector(".body").scrollTop = 0; }
     if (a === "back") { step--; draw(); }
@@ -6901,6 +7266,7 @@ EDITOR_JS = r"""
       canEdit = m.can_edit === true;
     } else if (m.type === "editor") {
       if (m.ok) D = m;
+      if (D && S && (S.use == null || (mode === "edit" && M && same(S.use, M.use)))) { S.use = mode === "edit" ? (D.use[cur] || []).slice() : []; if (M) M.use = S.use.slice(); }
       if (mode) { fillX(); draw(); }
     } else if (m.type === "catalogue") {
       if (m.q !== cat.q) return;
@@ -7333,6 +7699,144 @@ LOOK_JS = r"""
 """
 
 
+PRESET_HTML = """<div class="srow" id="pm-card"><h3><span class="emoji">🧩</span>Configure OrcaSlicer Presets</h3><div class="srow-body"><div class="srow-l">
+  <label class="check-row"><input id="pm-on" type="checkbox">Add My Spoolman Spools as OrcaSlicer Filament Presets</label>
+  <div class="hint">Spoolio keeps a filament preset for your spools, with their colour, temperatures, density and price. Spools you archive or use up are removed.</div>
+  <div id="pm-opts">
+    <div class="field-label">Create one preset per:</div>
+    <div class="seg"><label><input type="radio" name="pm-per" value="filament">Filament</label><label><input type="radio" name="pm-per" value="spool">Spool</label></div>
+    <div class="hint">Filament gives one preset for all spools of the same filament. Spool gives each spool its own, named with its ID.</div>
+    <div class="field-label">Make presets for these printers:</div>
+    <div id="pm-prs"></div>
+    <div class="hint">Names come from your Printer tab, like PLA Matte @ Bambu H2C. Each preset only shows when that printer is selected in OrcaSlicer, with any of its nozzles.</div>
+    <div class="hint">A spool loaded in a printer, on the Printer tab or by Live Link, only gets that printer's preset. Use With in Edit Spool changes this.</div>
+    <div class="field-label">Base each preset on:</div>
+    <div class="seg"><label><input type="radio" name="pm-base" value="auto">Printer's Own Preset</label><label><input type="radio" name="pm-base" value="pick">Choose Per Material</label></div>
+    <div id="pm-mats"></div>
+    <div class="hint">Flow, retraction and other settings Spoolman doesn't hold come from the printer's own preset for that material, or Generic if it has none.</div>
+    <div class="pm-sync" id="pm-sync"><span class="pm-dot"></span><span id="pm-st"></span><button type="button" class="pm-btn" id="pm-now">Sync Now</button></div>
+  </div>
+  <div class="hint warn" id="pm-warn" hidden><strong>!</strong> <span id="pm-wt"></span></div>
+</div><div class="srow-r" id="pm-prev"></div></div></div>"""
+
+PRESET_CSS = """
+  #pm-card .pm-sq { display: inline-block; width: 12px; height: 12px; border-radius: 3px; border: 1px solid var(--orca-border); margin-right: 8px; vertical-align: -2px; flex: none; }
+  #pm-card #pm-opts .field-label { margin-top: 14px; }
+  #pm-card #pm-opts .hint { margin-top: 6px; }
+  #pm-card .hint.warn { margin-top: 14px; }
+  #pm-card .pm-pr { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+  #pm-card .pm-pr .check-row { margin: 0; flex: 1; min-width: 0; }
+  #pm-card .pm-pr select, #pm-card .pm-mat select { max-width: 55%; background: var(--orca-bg); color: var(--orca-fg); border: 1px solid var(--orca-border); border-radius: 6px; padding: 4px 6px; font: inherit; font-size: 12px; }
+  #pm-card .pm-nz { margin: -2px 0 6px 24px; font-size: 11.5px; color: var(--orca-muted); }
+  #pm-card .pm-mat { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+  #pm-card .pm-mat span { width: 70px; font-weight: 600; }
+  #pm-card .pm-mat select { max-width: none; flex: 1; }
+  #pm-card .pm-sync { display: flex; align-items: center; gap: 8px; margin-top: 14px; font-size: 12px; color: var(--orca-muted); }
+  #pm-card .pm-dot { width: 8px; height: 8px; border-radius: 50%; background: #2e9d5b; flex: none; }
+  #pm-card .pm-sync.bad .pm-dot { background: #d9534f; }
+  #pm-card .pm-sync.idle .pm-dot { background: var(--orca-muted); }
+  #pm-card .pm-sync.bad #pm-st { color: #d9534f; }
+  #pm-card .pm-btn { margin-left: auto; border: 1px solid var(--orca-border); background: transparent; color: var(--orca-fg); border-radius: 6px; padding: 5px 12px; font: inherit; font-size: 12px; cursor: pointer; }
+  #pm-card .pm-dd { border: 1px solid var(--orca-border); border-radius: 6px; overflow: hidden; font-size: 12.5px; }
+  #pm-card .pm-dd-top { display: flex; align-items: center; padding: 7px 10px; border-bottom: 1px solid var(--orca-border); }
+  #pm-card .pm-car { margin-left: auto; color: var(--orca-muted); }
+  #pm-card .pm-grp { padding: 6px 10px 3px; font-size: 11px; font-weight: 600; color: var(--orca-muted); }
+  #pm-card .pm-it { display: flex; align-items: center; padding: 5px 10px; }
+  #pm-card .pm-it.sel { background: var(--orca-accent); color: var(--orca-accent-fg); }
+  #pm-card .pm-it.dim { color: var(--orca-muted); }
+  #pm-card .pm-tb { width: 100%; border-collapse: collapse; font-size: 12px; }
+  #pm-card .pm-tb td { padding: 4px 0; border-bottom: 1px solid var(--orca-border); }
+  #pm-card .pm-tb td:first-child { color: var(--orca-muted); width: 45%; }
+  #pm-card .pm-l { margin-top: 14px; }
+  #pm-card .pm-note { font-size: 12px; color: var(--orca-muted); border: 1px dashed var(--orca-border); border-radius: 8px; padding: 14px; }
+  #pm-card.pm-off #pm-opts { opacity: .45; pointer-events: none; }
+  #pm-card.pm-off .pm-sync { display: none; }
+  #pm-card.pm-na .srow-body > .srow-l > *:not(#pm-warn):not(.check-row), #pm-card.pm-na #pm-opts { opacity: .45; pointer-events: none; }
+  #pm-card.pm-na .check-row { opacity: .45; pointer-events: none; }
+  #pm-real .spool-card { margin: 0; }
+  #pm-real .spool-edit, #pm-real .spool-cart { display: none; }
+"""
+
+PRESET_JS = r"""
+  var $ = function (id) { return document.getElementById(id); };
+  var card = $("pm-card"), I = null, C = null, t = 0;
+  if (!card) return;
+  function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
+  function radio(n) { var x = document.querySelector('input[name="' + n + '"]:checked'); return x ? x.value : ""; }
+  function setRadio(n, v) { var x = document.querySelector('input[name="' + n + '"][value="' + v + '"]'); if (x) x.checked = true; }
+  function sq(c) { return '<span class="pm-sq" style="background:' + esc(c || "transparent") + '"></span>'; }
+  function cur() {
+    var pr = {}, bs = Object.assign({}, C ? C.bases : {});
+    document.querySelectorAll("#pm-prs [data-p]").forEach(function (r) { pr[r.dataset.p] = { on: r.querySelector("input").checked, group: r.querySelector("select").value }; });
+    document.querySelectorAll("#pm-mats select").forEach(function (s) { if (s.value) bs[s.dataset.m] = s.value; else delete bs[s.dataset.m]; });
+    return { on: $("pm-on").checked, per: radio("pm-per") || "filament", base: radio("pm-base") || "auto", printers: pr, bases: bs };
+  }
+  function spoolman() { var x = document.querySelector('input[name="spool-source"]:checked'); return !x || x.value === "spoolman"; }
+  function look() {
+    document.querySelectorAll("#pm-card .seg input").forEach(function (r) { r.parentNode.classList.toggle("on", r.checked); });
+    var na = !I || !I.api || !spoolman();
+    card.classList.toggle("pm-na", na);
+    card.classList.toggle("pm-off", !$("pm-on").checked);
+    $("pm-wt").textContent = I && !I.api ? "This version of OrcaSlicer can't add presets." : !spoolman() ? "Only available with Spoolman as your spool source." : "";
+    $("pm-warn").hidden = !$("pm-wt").textContent;
+  }
+  function ask() { clearTimeout(t); t = setTimeout(function () { orca.postMessage({ type: "presets_info", cfg: cur() }); }, 150); }
+  function nz(names) {
+    var s = (names || []).map(function (n) { var m = /(\d+(?:\.\d+)?)\s*(?:mm\s*)?nozzle/i.exec(n); return m ? m[1] : ""; }).filter(Boolean);
+    return s.length ? "Nozzles: " + s.join(", ") + " mm" : (names || []).length ? names.length + " printer preset" + (names.length > 1 ? "s" : "") : "";
+  }
+  function status(d) {
+    var el = $("pm-sync"), st = d.status || {}, txt;
+    el.classList.remove("bad", "idle");
+    if (st.err) { el.classList.add("bad"); txt = st.err; }
+    else if (st.time) txt = st.n + " preset" + (st.n === 1 ? "" : "s") + " up to date, synced at " + st.time;
+    else { el.classList.add("idle"); txt = "Not synced yet. Save to create your presets."; }
+    $("pm-st").textContent = txt;
+  }
+  function prev(d) {
+    var s = d.sample, h;
+    if (!d.api) h = '<div class="pm-note">This version of OrcaSlicer can\'t add presets.</div>';
+    else if (!s) h = '<div class="pm-note">' + (d.printers.some(function (p) { return p.on && p.group; }) ? "Your presets show here once Spoolio has loaded your spools." : "Tick a printer to see the presets Spoolio will add.") + '</div>';
+    else {
+      h = '<div class="label">Your Spool</div><div id="pm-real">' + (window.__spoolioCard ? window.__spoolioCard(s.spool) : "") + '</div>' +
+        '<div class="label pm-l">In OrcaSlicer, With ' + esc(s.printer) + ' Selected</div>' +
+        '<div class="pm-dd"><div class="pm-dd-top">' + sq(s.colour) + esc(s.name) + '<span class="pm-car">▾</span></div><div class="pm-dd-list"><div class="pm-grp">Spoolio</div>' +
+        s.list.map(function (x) { return '<div class="pm-it' + (x.n === s.name ? " sel" : "") + '">' + sq(x.c) + esc(x.n) + '</div>'; }).join("") +
+        (s.more ? '<div class="pm-it dim">+ ' + s.more + ' more</div>' : "") +
+        '<div class="pm-grp">System</div><div class="pm-it dim">' + sq("#888") + esc(s.base) + '</div></div></div>' +
+        '<div class="label pm-l">Copied From Spoolman</div><table class="pm-tb">' +
+        s.rows.map(function (r) { return '<tr><td>' + esc(r[0]) + '</td><td>' + (r[0] === "Colour" && r[1].charAt(0) === "#" ? sq(r[1]) : "") + esc(r[1]) + '</td></tr>'; }).join("") + '</table>';
+    }
+    $("pm-prev").innerHTML = h;
+  }
+  function draw(d, full) {
+    I = d; C = d.cfg;
+    if (full) { $("pm-on").checked = C.on; setRadio("pm-per", C.per); setRadio("pm-base", C.base); }
+    var opts = function (g) { return '<option value="">Choose a Printer Preset</option>' + d.groups.map(function (x) { return '<option' + (x === g ? " selected" : "") + '>' + esc(x) + '</option>'; }).join(""); };
+    $("pm-prs").innerHTML = d.printers.length ? d.printers.map(function (p) {
+      return '<div class="pm-pr" data-p="' + esc(p.id) + '"><label class="check-row"><input type="checkbox"' + (p.on ? " checked" : "") + '>' + esc(p.name) + '</label><select>' + opts(p.group) + '</select></div>' +
+        '<div class="pm-nz">' + esc(p.group ? nz(p.nozzles) : "No OrcaSlicer printer preset matched. Choose one.") + '</div>';
+    }).join("") : '<div class="hint">Add your printers on the Printer tab first.</div>';
+    $("pm-mats").innerHTML = radio("pm-base") === "pick" ? (d.materials.length ? d.materials.map(function (m) {
+      return '<div class="pm-mat"><span>' + esc(m.m) + '</span><select data-m="' + esc(m.m) + '"><option value="">Printer\'s Own Preset</option>' +
+        m.opts.map(function (o) { return '<option' + (o === m.pick ? " selected" : "") + '>' + esc(o) + '</option>'; }).join("") + '</select></div>';
+    }).join("") : '<div class="hint">Spoolio lists your materials here once it has loaded your spools.</div>') : "";
+    status(d); prev(d); look();
+  }
+  card.addEventListener("change", function () { look(); ask(); });
+  document.querySelectorAll('input[name="spool-source"]').forEach(function (r) { r.addEventListener("change", look); });
+  $("pm-now").addEventListener("click", function () { $("pm-st").textContent = "Syncing…"; orca.postMessage({ type: "presets_sync", cfg: cur() }); });
+  window.__spoolioPresets = function () { return I && I.api ? cur() : null; };
+  orca.onMessage(function (d) {
+    if (!d) return;
+    if (d.type === "presets_info" && d.view === "settings") draw(d, !I || d.full);
+    else if (d.type === "show_view" && d.view === "settings") { I = null; orca.postMessage({ type: "presets_info" }); }
+  });
+  look();
+  orca.postMessage({ type: "presets_info" });
+"""
+
+
 def tab_html(initial_view: str, c: dict) -> str:
     """The spool list and Settings as two views of one page, under a shared header."""
     main_css, main_body, main_js = _split_page(main_html())
@@ -7367,6 +7871,7 @@ def tab_html(initial_view: str, c: dict) -> str:
         card(sec["check"], "Before You Start", sec["check-hint"]),
         card(sec["printer"], "Preview", sec["printer-preview"]),
         card(sec["stats"], "Preview", sec["stats-preview"]),
+        PRESET_HTML,
         look_html(),
         footer,
     ])
@@ -7377,6 +7882,8 @@ def tab_html(initial_view: str, c: dict) -> str:
     pv += "".join(m.group(0).replace("#view-main", "#pc .fl") + "\n"
                   for m in re.finditer(r"#view-main \.spool-rfid[^{}]*\{[^}]*\}", main_scoped))
     pv += "#pc .fl .spool-rfid { display: inline-flex; vertical-align: middle; margin: 0; }\n"
+    pv += "".join(m.group(0).replace("#view-main", "#pm-real") + "\n"
+                  for m in re.finditer(r"#view-main \.spool[^{}]*\{[^}]*\}", main_scoped))
     look_js = (LOOK_JS.replace("__FONTS__", json.dumps({k: css for k, _, _, _, css in LOOK_FONTS}))
                .replace("__THEMES__", json.dumps(THEMES))
                .replace("__LOOK__", json.dumps(c.get("appearance") or parse_look(None))))
@@ -7399,6 +7906,7 @@ def tab_html(initial_view: str, c: dict) -> str:
 {LOOK_CSS}
 {_fill(EDITOR_CSS, FONT=FONT_STACK)}
 {pv}
+{PRESET_CSS}
 </style>
 </head>
 <body>
@@ -7419,6 +7927,7 @@ def tab_html(initial_view: str, c: dict) -> str:
 <script>(function (bridge) {{{TAB_PREVIEW_JS}}})(window.__spoolio.settings);</script>
 <script>(function (bridge) {{{look_js}}})(window.__spoolio.settings);</script>
 <script>(function (orca) {{{EDITOR_JS}}})(window.__spoolio.main);</script>
+<script>(function (orca) {{{PRESET_JS}}})(window.__spoolio.settings);</script>
 </body>
 </html>
 """
@@ -7538,12 +8047,14 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
                                "weight_display": weight_mode(), "show_cart": cart_on(),
                                "spool_columns": spool_columns(), "can_edit": source() == "spoolman",
                                **printer_state(), **result})
+            if result.get("ok") and source() == "spoolman":
+                presets_sync(result["spools"])
 
         _bg(worker)
 
     def _save_settings(self, url, low_stock, plate_check=True,
                        plate_margin=DEFAULT_MARGIN, weight="both", cart=False, src="spoolman",
-                       progress=None, columns=None, stats=None, look=None):
+                       progress=None, columns=None, stats=None, look=None, presets=None):
         settings = {}
 
         def put(s):
@@ -7561,6 +8072,9 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
                 s["progress"] = parse_progress(progress)
             if stats is not None:
                 s["stats"] = parse_stats(stats)
+            if presets is not None:
+                old = parse_presets(s.get("presets"))
+                s["presets"] = parse_presets({**presets, "use": old["use"]}) if isinstance(presets, dict) else old
             if look is not None:
                 ap = s["appearance"] = parse_look(look, s)
                 s["weight_display"] = {v: k for k, v in WFMT.items()}[ap["wfmt"]]
@@ -7646,12 +8160,17 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
             saved = self._save_settings(url, data.get("low_stock"), data.get("plate_check"),
                                         data.get("plate_margin"), data.get("weight_display"),
                                         data.get("show_cart"), src, data.get("progress"),
-                                        data.get("spool_columns"), data.get("stats"), data.get("appearance"))
+                                        data.get("spool_columns"), data.get("stats"), data.get("appearance"),
+                                        data.get("presets"))
             if saved:
                 self._after_save()
                 self._settings_close()
         elif msg_type == "bambu_auth":
             self._bambu_sign_in(data)
+        elif msg_type == "presets_info":
+            _bg(lambda: self._settings_post(presets_info(data.get("cfg"))))
+        elif msg_type == "presets_sync":
+            _bg(lambda: (presets_sync(force=True), self._settings_post(presets_info(data.get("cfg")))))
         elif msg_type == "feedback":
             open_url(FEEDBACK_URL)
         elif msg_type == "check_update":
