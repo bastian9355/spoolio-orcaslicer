@@ -7717,9 +7717,11 @@ LOOK_CSS = """
   html.dn-s #view-main .spool-bar-track { margin: 9px 0 7px; height: 7px; }
   html.dn-s #view-main .spool-body { gap: 14px; }
   html.dn-s #view-main #list.cols-2 .spool-card { height: calc(100% - 14px); }
-  html.sw-spool #view-main #list .spool-swatch, .tp-sw.spool { background-image: radial-gradient(circle, var(--sp-card) 0 19%, rgba(0,0,0,.4) 20% 25%, rgba(255,255,255,.12) 26% 30%, transparent 31% 60%, rgba(0,0,0,.16) 61% 64%, transparent 65%) !important; }
-  html.sw-square #view-main #list .spool-swatch, .tp-sw.square { border-radius: 22% !important; }
-  html.sw-pill #view-main #list .spool-swatch, .tp-sw.pill { width: 10px !important; border-radius: 5px !important; margin: 0 13px; }
+  .tp-sw.spool { background-image: radial-gradient(circle, var(--sp-card) 0 19%, rgba(0,0,0,.4) 20% 25%, rgba(255,255,255,.12) 26% 30%, transparent 31% 60%, rgba(0,0,0,.16) 61% 64%, transparent 65%) !important; }
+  html.sw-spool #view-main .spool-swatch:not(.ams-dash), html.sw-spool #pc .spool-swatch { position: relative; }
+  html.sw-spool #view-main .spool-swatch:not(.ams-dash)::after, html.sw-spool #pc .spool-swatch::after { content: ""; position: absolute; inset: 0; border-radius: 50%; background: radial-gradient(circle, var(--sp-card) 0 19%, rgba(0,0,0,.4) 20% 25%, rgba(255,255,255,.12) 26% 30%, transparent 31% 60%, rgba(0,0,0,.16) 61% 64%, transparent 65%); }
+  html.sw-square #view-main .spool-swatch, html.sw-square #pc .spool-swatch, .tp-sw.square { border-radius: 22% !important; }
+  html.sw-pill #view-main .spool-swatch, html.sw-pill #pc .spool-swatch, .tp-sw.pill { width: 10px !important; border-radius: 5px !important; margin: 0 13px; }
   html.hd-tag #view-main #list .spool-tag, html.hd-rfid #view-main #list .spool-rfid, html.hd-cart #view-main #list .spool-cart { display: none !important; }
   html.rm *, html.rm *::before, html.rm *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
   html.cb #view-main .spool-weight.low { color: #e69f00 !important; }
@@ -8067,8 +8069,8 @@ LOOK_JS = r"""
 
 
 PRESET_HTML = """<div class="srow" id="pm-card"><h3><span class="emoji">🧩</span>Configure OrcaSlicer Presets</h3><div class="srow-body"><div class="srow-l">
-  <label class="check-row"><input id="pm-on" type="checkbox">Add My Spoolman Spools as OrcaSlicer Filament Presets</label>
-  <div class="hint">Spoolio keeps a filament preset for your spools, with their colour, temperatures, density and price. Spools you archive or use up are removed.</div>
+  <label class="check-row"><input id="pm-on" type="checkbox">Add Spoolman Spools as OrcaSlicer Filament Presets</label>
+  <div class="hint">Spoolio keeps a filament preset for your spools. Spools you archive or use up are removed.</div>
   <div id="pm-opts">
     <div class="field-label">Create one preset per:</div>
     <div class="seg"><label><input type="radio" name="pm-per" value="filament">Filament</label><label><input type="radio" name="pm-per" value="spool">Spool</label></div>
