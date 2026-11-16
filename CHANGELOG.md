@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.11.0] - 2026-11-16
+
+A long overdue feature; you can now add and edit Spoolman spools right from Spoolio and your spools can now become filament presets in OrcaSlicer, together with advanced tuning options, without needing to open Spoolman. Live Link also spots RFID enabled spools that aren't in Spoolman yet and offers to add them for you. There's a new Appearance tab which includes Light, Dark and the ability to create your own Custom themes right from the UI.
+
+### Added
+- You can now edit a spool by selecting the pencil next to its name, or add one with the new `+ Add Spool` button. The editor follows a guided approach.  You can pick a filament from your existing filaments i.e. stock replenishment, or create a completely new one. Changes to the filament itself (colour, temperatures, density and so on) are saved to that filament in Spoolman.
+
+- With Live Link enabled, when a Bambu RFID spool goes into your AMS that isn't in Spoolman yet, Spoolio can detect and offers to add it automatically. The filament, colour and amount left are filled in from the printer, and the spool's RFID tag is saved to Spoolman so it's recognised from then on. You can also skip the spool if you wish.
+
+- Your Spoolman extra fields show up in the card, each with the right kind of input: switches for yes/no fields, menus for choice fields, and number boxes with their units.
+
+- There is now an Appearance tab in Settings, next to General:
+  - Themes: Light, Dark or Custom. The theme builder lets you pick your own colours and corner roundness, and share your theme as a code.
+  - Layout: Compact, Comfortable or Spacious spacing, with one column, two columns or Auto (two columns when the window is wide enough).
+  - Spool cards: the swatch shape (circle, spool, square or pill) and which details are shown, including the manufacturer tag, material, colour code, diameter, location, RFID chip and reorder button.
+  - Accessibility: Reduce Motion, and Colour-Blind Friendly Status Colours.
+  - Font and text size.
+
+- An option now exists within Settings to turn your spools into OrcaSlicer filament presets, under General > Configure OrcaSlicer Presets.
+  - Make one preset per filament or one per spool. Presets are named after your printer, in my case "PLA Matte - Black @ Bambu H2C", and only show when that printer is selected in OrcaSlicer, with any of its nozzles.
+  - A spool loaded in a printer, on the Printer tab or picked up by Live Link from its RFID tag, only gets that printer's preset. Spools on the shelf get one for every printer you own. To choose for yourself, use the new Use With field in Edit Spool or Add Spool.
+  - Each preset copies the colour, vendor, nozzle and bed temperatures, density, diameter and cost per kg from Spoolman. Everything else, like flow and retraction, comes from the printer's own preset for that material, or one you choose per material.
+    - Advanced tuning can also be enabled via the Configuration, allowing your custom values for flow ratios, pressure advance, retraction etc. 
+    - When a slice uses values different from Spoolio, for example after a flow calibration, you can update your new calibrated values to Spoolman, Spoolio will prompt you notifying you of this change if it differs from the existing value. 
+  - Presets are kept in sync with Spoolman, and spools you archive or use up are removed from the list.
+  - Presets stay on your computer and are backed up automatically via OrcaCloud (OrcaSlicer feature, not mine).
+
+### Changed
+- Spool cards are now all the same height in two-column view, and the RFID chip sits over the swatch.
+
+- Weight display and the number of spool columns have moved from General to the new Appearance tab. Your existing choices carry over.
+
+### Known Limitations
+OrcaSlicer won't reload the presets while a filament preset has unsaved changes. Spoolio says so in Settings; save or discard your changes, then select Sync Now.
+
 ## [0.10.1] - 2026-11-13
 
 ### Fixed

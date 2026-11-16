@@ -6,13 +6,10 @@
 
 Spoolio is a Bambu Lab inspired filament management plugin for OrcaSlicer. It reads your spools from your self-hosted [Spoolman](https://github.com/Donkie/Spoolman) server or your Bambu Cloud account, shows what is loaded on each of your printers, follows your prints live and books the filament they used back to Spoolman. It works with Bambu Lab, Klipper (Moonraker), PrusaLink and OctoPrint printers.
 
-> [!IMPORTANT]
-> Spoolio ***<ins>is not</ins>*** a filament profile manager (nozzle temps, flow ratios, pressure advance etc) those settings are configured in your filament profiles within OrcaSlicer.  If you're looking for a tool that covers this now then I would recommend [PipSpool](https://github.com/Gadonk/pipspool-orcaslicer) or [FilamentHub](https://github.com/WeLizard/FilamentHub). This funtionality will make it's way into Spoolio in future updates.
-
-
 ## Key Features
 - **Spool cards:** Showing colour (including multi-colour spools), vendor, remaining weight, a progress bar in the spool's own colour and material / colour hex and diameter details, in one or two columns.
 - **Two sources:** Your self-hosted Spoolman server, or your Bambu Cloud account.
+- **Add and edit spools:** Add a spool or edit one without having to leave OrcaSlicer.  Live Link also offers to add spools that do not exist in your library yet.
 - **RFID:** Reads from the spool's `tag` extra field when present, or Spoolman's own `tag` field (requires Spoolman v0.27.0 or newer).
 - **Printer tab:** A card per printer showing what is loaded in each AMS, external spool, toolhead or MMU gate. Build your printers by hand and assign your spools to the slots, or link them for live data, with either spool source.
 - **Live Link:** Connect directly to your printers on your local network. Bambu Lab printers in LAN mode, Klipper (Moonraker, with Happy Hare gates read from the printer), PrusaLink and OctoPrint.
@@ -26,7 +23,7 @@ Spoolio is a Bambu Lab inspired filament management plugin for OrcaSlicer. It re
 - **Low-stock warning:** Spools under your low-stock threshold have their remaining weight colour graded as they get closer to empty.
 - **Reorder button:** Switch on the cart icon in `Settings` and low-stock spools get a button that opens a web search for the spool's manufacturer and lot number in Spoolman (or the filament name if there's no lot number).
 - **Set up your way:** Every setting on the Settings page has a live preview beside it. How cards look, weight as grams, percentage or both, thresholds, print progress, stats currency and more.
-- Matches OrcaSlicer's **light and dark theming**.
+- **Customise** the look and feel of your workflow with your own themes, share them across platforms and with other users or use Orca's inbuilt theming.  The choice is yours.
 - Built for **Windows, macOS and Linux** (x86_64 and arm64).
 
 ## Images
@@ -109,6 +106,22 @@ OrcaSlicer asks before a plugin does anything sensitive. Expect a prompt the fir
 > - **Klipper, PrusaLink and OctoPrint:** the grams come from the print file, booked to the spool you assigned to each toolhead or gate. You're always asked before these are booked.
 >
 > Your last five prints sit under **Recent Bookings**, where you can change the spool or grams before booking. Once booked, ***Undo*** adds the weight back to each spool in Spoolman. Slots whose spool can't be identified, cancelled prints (estimated from the progress) and prints that finished while Spoolio wasn't connected always need booking by hand, and nothing is booked twice. Bambu Cloud has no booking, as there is no way to write to its filament library.
+>
+> ### Adding and Editing Spools
+> When Spoolman is selected as your source, a pencil icon next to the spools name enables you to edit the preset, or you can add a new one with the `+ Add Spool`. The card walks you through the initial setup. You can also configure advanced tuning options (if enabled in Settings) allowing you to individually fine tune filaments. 
+>
+> Bambu users who have Live Link enabled, Spoolio will detect a new RFID spool that isn't in your library and offer to create one for you. Most of the details should be identified from the RFID chip already.
+>
+> ### OrcaSlicer Presets
+> Under ***Configure OrcaSlicer Presets*** in Settings, switch on ***Add My Spoolman Spools as OrcaSlicer Filament Presets*** and tick the printers from your Printer tab to make presets for. Spoolio matches each one to its OrcaSlicer printer, so you choose the printer and the presets work with any of its nozzles.
+> - Make **one preset per filament** or **one per spool**. Presets are named after your printer e.g. `PLA Matte - Black @ Bambu H2C`, and only show when that printer is selected.
+> - A spool loaded in a printer, on the Printer tab or picked up by Live Link from its RFID tag, only gets that printer's preset. Spools on the shelf get one for every ticked printer. ***Use With*** in Edit Spool or Add Spool lets you choose yourself.
+> - Under **Take these from Spoolman**, choose which of colour, nozzle and bed temperatures, density and diameter, and cost come from Spoolman. Anything else comes from the printer's own preset for that material, or one you choose per material.
+> - Presets stay in sync with Spoolman and are removed when you archive or use up a spool. They're kept on your computer and can be uploaded to OrcaCloud for backup.
+>
+> **Advanced tuning.** Tick ***Use Advanced Tuning From Spoolman*** and pick which values to use: flow ratio, pressure advance, max volumetric speed and retraction length and speed. Set them on the **Tuning** step of Edit Spool or Add Spool, or press ***Save From OrcaSlicer*** to copy them from the filament preset you have selected. They're stored as extra fields on the filament in Spoolman (Spoolio creates the fields for you, if they don't already exist), and pressure advance can have a value for all printers plus one per printer. With one preset per spool, ***This Spool Only*** saves values that override the filament's for just that spool.
+>
+> When a slice uses values that differ from your Spoolio preset, because you ran a calibration or changed the preset, Spoolio asks whether to ***Update Spoolman***. A Bambu printer that has calibrated pressure advance (K) for an RFID spool in its AMS is offered the same way, saved as that printer's value. ***Not Now*** stops it asking about those values.
 >
 > ### Statistics
 > The **Stats** tab is built from the prints Spoolio books, so it starts filling once booking is on. Pick a period to see filament used, prints booked, cost, low stock and wasted filament including that from supports and purge,, weekly use split by colour, materials, your most used spools, those running low with a rough time left, and how much went on the model with your most wasteful prints. Calibration prints (flow rate, pressure advance, temperature and retraction towers, input shaping tests and the like) are recognised by their name and shown as their own **Calibration** slice and chip in your print history, so they don't count as waste. Costs come from your spool prices in Spoolman. You can switch the tab off or change the currency symbol under ***Configure Stats*** in Settings. History keeps being recorded while the tab is hidden.
