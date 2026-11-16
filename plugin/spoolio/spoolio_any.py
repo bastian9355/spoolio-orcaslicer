@@ -6,7 +6,7 @@
 # name = "Spoolio"
 # description = "A Bambu Lab inspired inventory management overview for OrcaSlicer"
 # author = "Dan J Moore"
-# version = "0.11.1"
+# version = "0.11.2"
 # ///
 
 # Spoolio - filament management for OrcaSlicer
@@ -43,7 +43,7 @@ import orca.pages
 _SLICING = hasattr(getattr(orca, "slicing", None), "SlicingPipelineCapabilityBase")
 
 PLUGIN_NAME = "Spoolio"
-PLUGIN_VERSION = "0.11.1"
+PLUGIN_VERSION = "0.11.2"
 # Stamped per operating system by scripts/build.py.
 BUILD_TARGET = "any"
 
@@ -5195,6 +5195,26 @@ MAIN_PAGE = """
       return '<span class="pj-who"><span class="live-dot' + (lv.age > 180 ? " stale" : "") + '"></span>' + esc(lv.name) + '</span>';
     }
 
+    function progSync(old, fresh) {
+      const o = old.childNodes, n = fresh.childNodes;
+      if (o.length !== n.length) { old.innerHTML = fresh.innerHTML; return; }
+      for (let i = 0; i < o.length; i++) {
+        const x = o[i], y = n[i];
+        if (x.nodeType !== y.nodeType || x.nodeName !== y.nodeName) { old.replaceChild(y.cloneNode(true), x); continue; }
+        if (x.nodeType === 3) { if (x.data !== y.data) x.data = y.data; continue; }
+        Array.prototype.slice.call(x.attributes).forEach(function (a) { if (!y.hasAttribute(a.name)) x.removeAttribute(a.name); });
+        Array.prototype.slice.call(y.attributes).forEach(function (a) { if (x.getAttribute(a.name) !== a.value) x.setAttribute(a.name, a.value); });
+        progSync(x, y);
+      }
+    }
+
+    function progPut(html) {
+      if (!html || !progSlot.firstChild) { progSlot.innerHTML = html; return; }
+      const t = document.createElement("div");
+      t.innerHTML = html;
+      progSync(progSlot, t);
+    }
+
     function renderProgress() {
       const list = liveOn && progress.on ? liveData.printers.filter(function (lv) {
         return (liveData.links || {})[lv.link] === "live" && lv.job;
@@ -5207,18 +5227,9 @@ MAIN_PAGE = """
         return '<div class="pj-idle">' + (title ? "<b>Print Progress</b>" : "") + '<span class="pj-chip idle">Idle</span>' +
           '<span class="sub">No print running</span>' + progWho(lv) + '</div>';
       };
-      if (!busy.length) { progSlot.innerHTML = '<div class="prog">' + idle.map(function (lv, i) { return idleRow(lv, i === 0); }).join("") + '</div>'; return; }
-      const was = {};
-      progSlot.querySelectorAll(".pj-fill[data-k]").forEach(function (e) { was[e.dataset.k] = e.style.width; });
-      progSlot.innerHTML = '<div class="prog"><div class="prog-h"><b>Print Progress</b><span class="sub"><span class="live-dot' + (busy.every(function (lv) { return lv.age > 180; }) ? " stale" : "") + '"></span>Live</span></div>' +
-        busy.map(progRow).join("") + idle.map(function (lv) { return idleRow(lv, false); }).join("") + '</div>';
-      progSlot.querySelectorAll(".pj-fill[data-k]").forEach(function (e) {
-        const to = e.style.width, from = was[e.dataset.k];
-        if (!from || from === to) return;
-        e.style.width = from;
-        void e.offsetWidth;
-        e.style.width = to;
-      });
+      if (!busy.length) { progPut('<div class="prog">' + idle.map(function (lv, i) { return idleRow(lv, i === 0); }).join("") + '</div>'); return; }
+      progPut('<div class="prog"><div class="prog-h"><b>Print Progress</b><span class="sub"><span class="live-dot' + (busy.every(function (lv) { return lv.age > 180; }) ? " stale" : "") + '"></span>Live</span></div>' +
+        busy.map(progRow).join("") + idle.map(function (lv) { return idleRow(lv, false); }).join("") + '</div>');
     }
 
     function renderPrinters() {
@@ -7045,6 +7056,8 @@ EDITOR_CSS = """
   #pc .rail { width: 210px; flex-shrink: 0; border-right: 1px solid var(--orca-border); padding: 12px 10px; display: flex; flex-direction: column; gap: 2px; background: color-mix(in srgb, var(--orca-fg) 2%, transparent); }
   #pc .st { display: flex; gap: 10px; align-items: flex-start; padding: 9px 10px; border-radius: 8px; cursor: pointer; border: 0; background: none; color: inherit; font-size: 13px; text-align: left; width: 100%; }
   #pc .st:hover { background: color-mix(in srgb, var(--orca-fg) 6%, transparent); }
+  #pc .st.lock { opacity: .5; cursor: not-allowed; }
+  #pc .st.lock:hover { background: none; }
   #pc .st.on { background: color-mix(in srgb, var(--orca-accent) 18%, transparent); }
   #pc .st .n { width: 22px; height: 22px; flex-shrink: 0; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11.5px; font-weight: 700; border: 1.5px solid var(--orca-border); color: var(--orca-muted); }
   #pc .st.on .n { background: var(--orca-accent); border-color: var(--orca-accent); color: var(--orca-accent-fg); }
@@ -7140,7 +7153,7 @@ EDITOR_CSS = """
   #pc .dh { display: flex; align-items: center; gap: 10px; font-size: 16px; font-weight: 700; margin-bottom: 14px; }
   #pc .pulse { width: 10px; height: 10px; border-radius: 50%; background: #3fb950; box-shadow: 0 0 0 4px rgba(63,185,80,.2); animation: live-pulse 2s ease-out infinite; }
   #pc:not([hidden]) { animation: pc-fade .18s ease-out; }
-  #pc .card, #pc .dcard { animation: pc-pop .22s ease-out; }
+  #pc.fresh .card, #pc .dcard { animation: pc-pop .22s ease-out; }
   #pt:not([hidden]) { animation: pt-up .25s ease-out; }
   @keyframes pc-fade { from { opacity: 0; } }
   @keyframes pc-pop { from { opacity: 0; transform: translateY(10px) scale(.98); } }
@@ -7463,11 +7476,13 @@ EDITOR_JS = r"""
       : '<button class="sb pri" data-a="next"' + (ok(id) ? "" : " disabled") + '>Next: ' + st[step + 1][1] + ' ›</button>';
     var quick = mode === "edit" && !last && n ? '<button class="sb" data-a="save"' + (busy ? " disabled" : "") + '>' + (busy ? "Saving…" : nc) + '</button>' : "";
     var top = pc.querySelector(".body"), y = top ? top.scrollTop : 0, same0 = pc.dataset.at === mode + step;
+    pc.classList.toggle("fresh", pc.hidden);
     pc.innerHTML = '<div class="card">' +
       '<div class="top"><h2>' + (mode === "add" ? "Add Spool" : esc(M.name || "Spool") + '<span>Spool #' + esc(cur) + '</span>') + '</h2><button class="x" data-a="close" title="Close">×</button></div>' +
       '<div class="mid"><nav class="rail">' + st.map(function (x, i) {
         var cls = (i === step ? " on" : "") + (mode === "edit" && chgStep(x[0]) ? " chg" : (i < step && ok(x[0]) ? " done" : ""));
-        return '<button class="st' + cls + '" data-go="' + i + '"><span class="n">' + (cls.indexOf("done") >= 0 ? "✓" : i + 1) + '</span><span><b>' + x[1] + '</b><small>' + esc(sum(x[0])) + '</small></span></button>';
+        var lk = i > 0 && !ok("fil") ? " lock" : "";
+        return '<button class="st' + cls + lk + '" data-go="' + i + '"' + (lk ? ' aria-disabled="true"' : "") + '><span class="n">' + (cls.indexOf("done") >= 0 ? "✓" : i + 1) + '</span><span><b>' + x[1] + '</b><small>' + esc(sum(x[0])) + '</small></span></button>';
       }).join("") +
       '<div class="mini"><span class="d" style="background:#' + (S.color_hex || "555555") + '"></span><span><b>' + esc(S.name || "New Spool") + '</b><span>' + g(S.remaining_weight) + (S.location ? " · " + esc(S.location) : "") + '</span></span></div></nav>' +
       '<div class="body"><h3><span class="emoji">' + st[step][2] + '</span>' + st[step][1] + '</h3><p class="lead">' + lead[id] + '</p>' +
@@ -7595,7 +7610,7 @@ EDITOR_JS = r"""
     if (e.target === pc) { if (!mode) { pc.hidden = true; return; } return close(); }
     var t = e.target.closest("[data-a],[data-go],[data-src],[data-pick],[data-used],[data-xb],[data-use],[data-tg]"); if (!t) return;
     var d = t.dataset;
-    if (d.go != null) { step = +d.go; ask = ""; draw(); pc.querySelector(".body").scrollTop = 0; return; }
+    if (d.go != null) { if (+d.go > 0 && !ok("fil")) return; step = +d.go; ask = ""; draw(); pc.querySelector(".body").scrollTop = 0; return; }
     if (d.src) { src = d.src; q = ""; draw(); return; }
     if (d.pick != null) { var r = pFil.rows[+d.pick]; if (r) { fromFil(r.f, src); draw(); } return; }
     if (d.used != null) {

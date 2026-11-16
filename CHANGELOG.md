@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.2] - 2026-11-16
+
+### Fixed
+- Fixed an issue that would cause a screen flicker when adding a new spool, also fixed a issue that could allow a user to jump ahead when adding a new or existing spool profile in the step menu. 
+
+- Fixed a bug that caused animations to not apply correctly on the Print Progress card.
+
 ## [0.11.1] - 2026-11-16
 
 A small follow-up to 0.11.0. The Printer tab now matches your chosen swatch shape, live print progress actually moves, and a few bits of Settings wording have been tidied up.
