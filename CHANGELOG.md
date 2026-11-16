@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.11.1] - 2026-11-16
+
+A small follow-up to 0.11.0. The Printer tab now matches your chosen swatch shape, live print progress actually moves, and a few bits of Settings wording have been tidied up.
+
+### Changed
+- Spool swatches on the Printer tab now follow the swatch shape you pick under Appearance. The preview card in Edit Spool and Add Spool also inherit this change to keep it uniform throughout.
+
+- The bar of a running print has a moving shimmer and grows smoothly as the percentage goes up, and the Live dot gently pulses, plus some other animations elsewhere. Reduce Motion under Appearance > Configure Accessibility turns all of this off. The idea for animations came after the preview card design and I thought why didn't I do that for everything else...facepalm.
+
+- Large and Extra Large text sizes are now 110% and 120% (were 115% and 130%), so it's not as overkill. If you'd picked one of them, it moves to the new size automatically.
+
+- Tidied up the wording in Configure OrcaSlicer Presets. The toggle is now "Add Spoolman Spools as OrcaSlicer Filament Presets", with shorter helper text.
+
+### Removed
+- Ounces as a weight unit. If you had it selected, Spoolio goes back to grams.  Not sure why I decided this was a unit of measure people would find useful...but I've removed it now.
+
+- A couple of hints in Appearance that didn't add much: the one under Text Size about scaling the whole tab, and the one under Choose a Theme.
+
+### Fixed
+- Multi-colour spools lost their colours when the swatch shape was set to Spool. They now keep them.
+
 ## [0.11.0] - 2026-11-16
 
 A long overdue feature; you can now add and edit Spoolman spools right from Spoolio and your spools can now become filament presets in OrcaSlicer, together with advanced tuning options, without needing to open Spoolman. Live Link also spots RFID enabled spools that aren't in Spoolman yet and offers to add them for you. There's a new Appearance tab which includes Light, Dark and the ability to create your own Custom themes right from the UI.

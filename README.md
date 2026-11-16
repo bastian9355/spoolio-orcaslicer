@@ -113,7 +113,7 @@ OrcaSlicer asks before a plugin does anything sensitive. Expect a prompt the fir
 > Bambu users who have Live Link enabled, Spoolio will detect a new RFID spool that isn't in your library and offer to create one for you. Most of the details should be identified from the RFID chip already.
 >
 > ### OrcaSlicer Presets
-> Under ***Configure OrcaSlicer Presets*** in Settings, switch on ***Add My Spoolman Spools as OrcaSlicer Filament Presets*** and tick the printers from your Printer tab to make presets for. Spoolio matches each one to its OrcaSlicer printer, so you choose the printer and the presets work with any of its nozzles.
+> Under ***Configure OrcaSlicer Presets*** in Settings, switch on ***Add Spoolman Spools as OrcaSlicer Filament Presets*** and tick the printers from your Printer tab to make presets for. Spoolio matches each one to its OrcaSlicer printer, so you choose the printer and the presets work with any of its nozzles.
 > - Make **one preset per filament** or **one per spool**. Presets are named after your printer e.g. `PLA Matte - Black @ Bambu H2C`, and only show when that printer is selected.
 > - A spool loaded in a printer, on the Printer tab or picked up by Live Link from its RFID tag, only gets that printer's preset. Spools on the shelf get one for every ticked printer. ***Use With*** in Edit Spool or Add Spool lets you choose yourself.
 > - Under **Take these from Spoolman**, choose which of colour, nozzle and bed temperatures, density and diameter, and cost come from Spoolman. Anything else comes from the printer's own preset for that material, or one you choose per material.
