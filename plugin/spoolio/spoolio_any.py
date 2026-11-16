@@ -277,7 +277,7 @@ def stats_settings() -> dict:
 
 
 FONTS = ("def", "sans", "wide", "serif", "mono")
-SIZES = (90, 100, 115, 130)
+SIZES = (90, 100, 110, 120)
 
 
 THEMES = {
@@ -289,7 +289,7 @@ THEMES = {
 SHOW = ("tag", "mat", "hex", "dia", "loc", "rfid", "cart")
 LOOK_PICKS = {"theme": ("dark", "light", "custom"), "density": ("comfy", "compact", "spacious"),
               "cols": ("1", "2", "auto"), "swatch": ("circle", "spool", "square", "pill"),
-              "units": ("g", "kg", "oz"), "wfmt": ("both", "w", "pct")}
+              "units": ("g", "kg"), "wfmt": ("both", "w", "pct")}
 WFMT = {"grams": "w", "percent": "pct", "both": "both"}
 
 
@@ -298,6 +298,7 @@ def parse_look(value: object, legacy: dict | None = None) -> dict:
     v = value if isinstance(value, dict) else {}
     old = legacy or {}
     size = _num_or(v.get("size"), 100)
+    size = {115: 110, 130: 120}.get(size, size)
     out = {"font": v.get("font") if v.get("font") in FONTS else "def", "size": size if size in SIZES else 100}
     dflt = {"cols": "2" if old.get("spool_columns") in (2, "2") else "1",
             "wfmt": WFMT.get(old.get("weight_display"), "both")}
@@ -4125,7 +4126,7 @@ MAIN_PAGE = """
     height: 5px; border-radius: 3px; margin: 6px 0 5px;
     background: rgba(127, 127, 127, 0.25); overflow: hidden;
   }
-  .spool-bar-fill { height: 100%; border-radius: 3px; }
+  .spool-bar-fill { height: 100%; border-radius: 3px; transition: width .6s ease; }
   .spool-pct { font-size: 12px; color: var(--orca-muted); }
   .spool-weight.low .spool-pct { color: inherit; opacity: 0.8; }
   .spool-dup {
@@ -4324,6 +4325,8 @@ MAIN_PAGE = """
   .plate.on-printer > .divider:last-child { display: none; }
   .live-dot { display: inline-block; width: 8px; height: 8px; margin-right: 6px; border-radius: 50%; background: #3fb950; }
   .live-dot.stale { background: #e0a030; }
+  .live-dot:not(.stale) { animation: live-pulse 2s ease-out infinite; }
+  @keyframes live-pulse { 0% { box-shadow: 0 0 0 0 rgba(63, 185, 80, .55); } 70%, 100% { box-shadow: 0 0 0 6px rgba(63, 185, 80, 0); } }
   .usage { margin: 0 0 14px; border: 1px solid var(--orca-border); border-radius: 10px; background: color-mix(in srgb, var(--orca-fg) 4%, var(--orca-bg) 96%); }
   .usage-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 10px 14px; color: var(--orca-fg); }
   .usage-bar b { font-weight: 700; }
@@ -4380,7 +4383,9 @@ MAIN_PAGE = """
   .pj-chip.idle { background: rgba(127, 127, 127, 0.2); color: var(--orca-muted); }
   .pj-pct { margin-left: auto; font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums; }
   .pj-track { height: 10px; margin: 9px 0 8px; border-radius: 5px; background: rgba(127, 127, 127, 0.25); overflow: hidden; }
-  .pj-fill { height: 100%; border-radius: 5px; background: var(--orca-accent); }
+  .pj-fill { height: 100%; border-radius: 5px; background: var(--orca-accent); transition: width .9s ease; }
+  .pj-fill.run { background: linear-gradient(90deg, var(--orca-accent) 0 40%, color-mix(in srgb, var(--orca-accent) 35%, #fff) 50%, var(--orca-accent) 60% 100%); background-size: 250% 100%; animation: pj-run 1.6s linear infinite; }
+  @keyframes pj-run { from { background-position: 100% 0; } to { background-position: -150% 0; } }
   .pj-fill.warn { background: #d29922; }
   .pj-fill.ok { background: #3fb950; }
   .pj-fill.bad { background: #d9534f; }
@@ -4921,7 +4926,7 @@ MAIN_PAGE = """
     }
 
     const PROG_STATES = {
-      RUNNING: ["Printing", "", ""], PREPARE: ["Preparing", "", "prep"], SLICING: ["Preparing", "", "prep"],
+      RUNNING: ["Printing", "", "run"], PREPARE: ["Preparing", "", "prep"], SLICING: ["Preparing", "", "prep"],
       PAUSE: ["Paused", "warn", "warn"], FINISH: ["Finished", "ok", "ok"], FAILED: ["Failed", "bad", "bad"]
     };
     const PROG_LIVE = ["RUNNING", "PREPARE", "SLICING", "PAUSE"];
@@ -5182,7 +5187,7 @@ MAIN_PAGE = """
       }
       return '<div class="pj"><div class="pj-top"><span class="pj-name">' + esc(j.name || "Print") + '</span><span class="pj-chip ' + s[1] + '">' + s[0] + '</span>' +
         progWho(lv) + '<span class="pj-pct">' + (s[2] === "prep" ? "" : pct + "%") + '</span></div>' +
-        '<div class="pj-track"><div class="pj-fill ' + s[2] + '" style="width:' + pct + '%"></div></div>' +
+        '<div class="pj-track"><div class="pj-fill ' + s[2] + '" data-k="' + esc(lv.link || lv.name) + '" style="width:' + pct + '%"></div></div>' +
         '<div class="pj-meta">' + meta.join("") + '</div></div>';
     }
 
@@ -5203,8 +5208,17 @@ MAIN_PAGE = """
           '<span class="sub">No print running</span>' + progWho(lv) + '</div>';
       };
       if (!busy.length) { progSlot.innerHTML = '<div class="prog">' + idle.map(function (lv, i) { return idleRow(lv, i === 0); }).join("") + '</div>'; return; }
+      const was = {};
+      progSlot.querySelectorAll(".pj-fill[data-k]").forEach(function (e) { was[e.dataset.k] = e.style.width; });
       progSlot.innerHTML = '<div class="prog"><div class="prog-h"><b>Print Progress</b><span class="sub"><span class="live-dot' + (busy.every(function (lv) { return lv.age > 180; }) ? " stale" : "") + '"></span>Live</span></div>' +
         busy.map(progRow).join("") + idle.map(function (lv) { return idleRow(lv, false); }).join("") + '</div>';
+      progSlot.querySelectorAll(".pj-fill[data-k]").forEach(function (e) {
+        const to = e.style.width, from = was[e.dataset.k];
+        if (!from || from === to) return;
+        e.style.width = from;
+        void e.offsetWidth;
+        e.style.width = to;
+      });
     }
 
     function renderPrinters() {
@@ -5699,7 +5713,6 @@ MAIN_PAGE = """
     function formatWeight(grams) {
       if (typeof grams !== "number") return "?";
       if (units === "kg") return (grams / 1000).toFixed(Math.abs(grams) < 100 ? 3 : 2) + " kg";
-      if (units === "oz") return (grams / 28.3495).toFixed(1) + " oz";
       return Math.abs(grams) >= 1000
         ? (grams / 1000).toFixed(2) + " kg"
         : Math.round(grams) + " g";
@@ -7125,7 +7138,13 @@ EDITOR_CSS = """
   #pc .row { display: flex; justify-content: flex-end; gap: 8px; }
   #pc .dcard { width: 440px; max-width: 100%; background: color-mix(in srgb, var(--orca-fg) 4%, var(--orca-bg)); border: 1px solid var(--orca-border); border-radius: 14px; padding: 18px 20px; color: var(--orca-fg); font-size: 13px; line-height: 1.45; box-shadow: 0 18px 50px rgba(0,0,0,.45); }
   #pc .dh { display: flex; align-items: center; gap: 10px; font-size: 16px; font-weight: 700; margin-bottom: 14px; }
-  #pc .pulse { width: 10px; height: 10px; border-radius: 50%; background: #3fb950; box-shadow: 0 0 0 4px rgba(63,185,80,.2); }
+  #pc .pulse { width: 10px; height: 10px; border-radius: 50%; background: #3fb950; box-shadow: 0 0 0 4px rgba(63,185,80,.2); animation: live-pulse 2s ease-out infinite; }
+  #pc:not([hidden]) { animation: pc-fade .18s ease-out; }
+  #pc .card, #pc .dcard { animation: pc-pop .22s ease-out; }
+  #pt:not([hidden]) { animation: pt-up .25s ease-out; }
+  @keyframes pc-fade { from { opacity: 0; } }
+  @keyframes pc-pop { from { opacity: 0; transform: translateY(10px) scale(.98); } }
+  @keyframes pt-up { from { opacity: 0; transform: translate(-50%, 12px); } }
   #pc .dsp { display: flex; gap: 12px; align-items: center; padding: 10px 12px; border: 1px solid var(--orca-border); border-radius: 10px; }
   #pc .dsp .d { width: 34px; height: 34px; border-radius: 50%; flex-shrink: 0; }
   #pc .dsp small { display: block; color: var(--orca-muted); font-size: 11.5px; }
@@ -7666,7 +7685,7 @@ LOOK_FONTS = [
     ("mono", "Monospace", "Every letter the same width", "Consolas · Menlo · DejaVu Sans Mono",
      f'Consolas, Menlo, "DejaVu Sans Mono", "Liberation Mono", {EMOJI}, monospace'),
 ]
-LOOK_SIZES = [(90, "Small"), (100, "Default"), (115, "Large"), (130, "Extra Large")]
+LOOK_SIZES = [(90, "Small"), (100, "Default"), (110, "Large"), (120, "Extra Large")]
 
 LOOK_CSS = """
   html.apf * { font-family: var(--apf) !important; }
@@ -7842,7 +7861,6 @@ def look_html() -> str:
         '</div></div></div>'
         '<div class="srow ap-pane"><h3><span class="emoji">🔎</span>Configure Text Size</h3><div class="srow-body"><div class="srow-l">'
         f'<div class="field-label">Show Text and Controls At:</div><div class="seg" id="ap-seg">{seg}</div>'
-        '<div class="hint">Scales everything in the Spoolio tab together, so cards, buttons and charts keep their shape.</div>'
         '<div class="hint" style="margin-top:14px"><button class="ap-reset" id="ap-reset">Reset Font and Text Size to Default</button></div>'
         f'</div><div class="srow-r"><div class="label">Preview</div><div class="ap-prev"><div class="sz-row" id="sz-row">{row}</div></div>'
         '<div class="hint" style="margin-top:10px">Only the Spoolio tab changes. OrcaSlicer\'s own windows and menus keep their size.</div>'
@@ -7888,7 +7906,6 @@ LOOK_JS = r"""
 
   function wt(g) {
     if (cur.units === "kg") return (g / 1000).toFixed(g < 100 ? 3 : 2) + " kg";
-    if (cur.units === "oz") return (g / 28.3495).toFixed(1) + " oz";
     return Math.round(g).toLocaleString("en-GB") + " g";
   }
   var sw = function (cls, c) { return '<div class="tp-sw ' + cls + '" style="background-color:' + c + '"></div>'; };
@@ -7922,7 +7939,7 @@ LOOK_JS = r"""
     var ck = function (k, t) { return '<label class="check-row"><input type="checkbox" data-show="' + k + '">' + t + '</label>'; };
     var h =
       '<div class="srow ap-pane th-pane"><h3><span class="emoji">🎨</span>Choose a Theme</h3><div class="th-grid" id="th-grid"></div>' +
-        '<div class="hint">Only the Spoolio tab changes. Custom starts as a copy of Dark.</div></div>' +
+        '</div>' +
       '<div class="srow ap-pane" id="tb"><h3><span class="emoji">🖌️</span>Build Your Theme</h3><div class="srow-body"><div class="srow-l">' +
         '<div class="field-label">Start From:</div><div class="tb-from">' + from + '</div>' +
         '<div class="tb-cols">' + cc + '</div>' +
@@ -7947,7 +7964,7 @@ LOOK_JS = r"""
         '<div class="hint" style="margin-top:4px">The cart button only shows on low spools.</div>' +
       '</div><div class="srow-r"><div class="label">Preview</div><div id="cd-prev"></div></div></div></div>' +
       '<div class="srow ap-pane"><h3><span class="emoji">⚖️</span>Configure Weights</h3><div class="srow-body"><div class="srow-l">' +
-        '<div class="field-label">Units:</div>' + seg("units", [["g", "Grams"], ["kg", "Kilograms"], ["oz", "Ounces"]]) +
+        '<div class="field-label">Units:</div>' + seg("units", [["g", "Grams"], ["kg", "Kilograms"]]) +
         '<div class="field-label">Show Remaining As:</div>' + seg("wfmt", [["w", "Weight"], ["pct", "Percent"], ["both", "Both"]]) +
         '<div class="hint">Spoolman still stores grams. Only the display changes.</div>' +
       '</div><div class="srow-r"><div class="label">Preview</div><div class="tp" id="wt-prev"></div></div></div></div>' +
@@ -8070,14 +8087,14 @@ LOOK_JS = r"""
 
 PRESET_HTML = """<div class="srow" id="pm-card"><h3><span class="emoji">🧩</span>Configure OrcaSlicer Presets</h3><div class="srow-body"><div class="srow-l">
   <label class="check-row"><input id="pm-on" type="checkbox">Add Spoolman Spools as OrcaSlicer Filament Presets</label>
-  <div class="hint">Spoolio keeps a filament preset for your spools. Spools you archive or use up are removed.</div>
+  <div class="hint">Spoolio keeps a filament preset for your spools.</div>
   <div id="pm-opts">
     <div class="field-label">Create one preset per:</div>
     <div class="seg"><label><input type="radio" name="pm-per" value="filament">Filament</label><label><input type="radio" name="pm-per" value="spool">Spool</label></div>
     <div class="hint">Filament gives one preset for all spools of the same filament. Spool gives each spool its own, named with its ID.</div>
     <div class="field-label">Make presets for these printers:</div>
     <div id="pm-prs"></div>
-    <div class="hint">Names come from your Printer tab, like PLA Matte @ Bambu H2C. Each preset only shows when that printer is selected in OrcaSlicer, with any of its nozzles.</div>
+    <div class="hint">Names come from your Printer tab, e.g. Filament @ Printer. Each preset only shows when that printer is selected in OrcaSlicer, with any of its nozzles.</div>
     <div class="hint">A spool loaded in a printer, on the Printer tab or by Live Link, only gets that printer's preset. Use With in Edit Spool changes this.</div>
     <div class="field-label">Base each preset on:</div>
     <div class="seg"><label><input type="radio" name="pm-base" value="auto">Printer's Own Preset</label><label><input type="radio" name="pm-base" value="pick">Choose Per Material</label></div>
@@ -8086,7 +8103,7 @@ PRESET_HTML = """<div class="srow" id="pm-card"><h3><span class="emoji">🧩</sp
     <div class="field-label">Take these from Spoolman:</div>
     <div class="pm-ck"><label class="check-row"><input type="checkbox" data-take="colour">Colour</label><label class="check-row"><input type="checkbox" data-take="temps">Nozzle and Bed Temperatures</label><label class="check-row"><input type="checkbox" data-take="dens">Density and Diameter</label><label class="check-row"><input type="checkbox" data-take="cost">Cost</label></div>
     <label class="check-row pm-tn"><input id="pm-tune" type="checkbox">Use Advanced Tuning From Spoolman</label>
-    <div class="hint">Adds a Tuning step to Edit Spool for your calibrated values, and offers to update Spoolman when a slice or your AMS uses new ones. Spoolio creates the Spoolman fields it needs.</div>
+    <div class="hint">Adds a Tuning step to Edit Spool for your calibrated values, and offers to update Spoolman whenever it detects a change from the preset.</div>
     <div class="pm-ck" id="pm-tks"><label class="check-row"><input type="checkbox" data-tk="flow">Flow Ratio</label><label class="check-row"><input type="checkbox" data-tk="pa">Pressure Advance</label><label class="check-row"><input type="checkbox" data-tk="mvs">Max Volumetric Speed</label><label class="check-row"><input type="checkbox" data-tk="rlen">Retraction Length</label><label class="check-row"><input type="checkbox" data-tk="rspd">Retraction Speed</label></div>
     <div class="hint" id="pm-tkh">Anything you leave blank in Spoolman comes from the base preset.</div>
     <div class="pm-sync" id="pm-sync"><span class="pm-dot"></span><span id="pm-st"></span><button type="button" class="pm-btn" id="pm-now">Sync Now</button></div>
