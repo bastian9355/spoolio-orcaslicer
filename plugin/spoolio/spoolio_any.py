@@ -7191,6 +7191,7 @@ EDITOR_JS = r"""
   var nv = function (a, b) { return a == null || a === "" ? (b == null ? "" : b) : a; };
   var r1 = function (n) { return Math.round(n * 10) / 10; };
   var r2 = function (n) { return typeof n === "number" ? Math.round(n * 100) / 100 : n; };
+  var cl = function (n) { return typeof n === "number" ? Number(n.toPrecision(12)) : Array.isArray(n) ? n.map(cl) : n; };
   var g = function (n) { return (n === "" || n == null || isNaN(n)) ? "-" : r1(Number(n)).toLocaleString("en-GB") + " g"; };
   var hex = function (c) { c = String(c || "").replace("#", ""); return /^[0-9a-fA-F]{6}/.test(c) ? c.slice(0, 6).toUpperCase() : ""; };
   var dec = function (v) { if (typeof v !== "string") return v; try { return JSON.parse(v); } catch (e) { return v; } };
@@ -7208,13 +7209,13 @@ EDITOR_JS = r"""
   function tv(ex) {
     ex = ex || {};
     var o = { by: {} }, by = dec(dec(ex.pressure_advance_printers));
-    Object.keys(TX).forEach(function (k) { var v = dec(dec(ex[TX[k]])); o[k] = typeof v === "number" ? v : ""; });
-    if (by && typeof by === "object") Object.keys(by).forEach(function (p) { if (typeof by[p] === "number") o.by[p] = by[p]; });
+    Object.keys(TX).forEach(function (k) { var v = dec(dec(ex[TX[k]])); o[k] = typeof v === "number" ? cl(v) : ""; });
+    if (by && typeof by === "object") Object.keys(by).forEach(function (p) { if (typeof by[p] === "number") o.by[p] = cl(by[p]); });
     return o;
   }
   function tfrom(t) {
     var o = tblank();
-    if (t) { Object.keys(TX).forEach(function (k) { o[k] = t[k] == null ? "" : t[k]; }); Object.keys(t.by || {}).forEach(function (p) { o.by[p] = t.by[p]; }); }
+    if (t) { Object.keys(TX).forEach(function (k) { o[k] = t[k] == null ? "" : cl(t[k]); }); Object.keys(t.by || {}).forEach(function (p) { o.by[p] = cl(t.by[p]); }); }
     return o;
   }
   function steps() {
@@ -7246,7 +7247,7 @@ EDITOR_JS = r"""
   function fillX() {
     fields().forEach(function (f) {
       if (!(f.key in S.extra)) {
-        var v = dec((raw0 || {})[f.key]);
+        var v = cl(dec((raw0 || {})[f.key]));
         if (v == null) v = f.type === "boolean" ? false : "";
         S.extra[f.key] = v;
         if (M) M.extra[f.key] = v;
@@ -7256,8 +7257,8 @@ EDITOR_JS = r"""
   function fromFil(f, how) {
     S.fid = how === "mine" ? f.id : null; S.ext_id = how === "cat" ? f.x : "";
     S.name = f.n || ""; S.vendor = f.v || ""; S.material = f.m || ""; S.color_hex = hex(f.c);
-    S.diameter = nv(f.dia, 1.75); S.density = nv(f.d, 1.24); S.ext = nv(f.e); S.bed = nv(f.b);
-    S.initial_weight = nv(f.w, 1000); S.spool_weight = nv(f.sw, 250);
+    S.diameter = cl(nv(f.dia, 1.75)); S.density = cl(nv(f.d, 1.24)); S.ext = cl(nv(f.e)); S.bed = cl(nv(f.b));
+    S.initial_weight = r2(nv(f.w, 1000)); S.spool_weight = r2(nv(f.sw, 250));
     if (!used) S.remaining_weight = S.initial_weight;
     if (ams) S.remaining_weight = ams.pct == null ? S.initial_weight : Math.round(S.initial_weight * ams.pct / 100);
     pick = how + ":" + (how === "mine" ? f.id : how === "cat" ? f.x : f.n);
@@ -7272,7 +7273,7 @@ EDITOR_JS = r"""
     var f = s.filament || {};
     mode = "edit"; cur = s.id; unlock = false; used = "rem"; raw0 = s.extra || {};
     S = { fid: f.id, ext_id: "", name: f.name || "", vendor: (f.vendor || {}).name || "", material: f.material || "", color_hex: hex(f.color_hex),
-      diameter: nv(f.diameter), density: nv(f.density), ext: nv(f.settings_extruder_temp), bed: nv(f.settings_bed_temp),
+      diameter: cl(nv(f.diameter)), density: cl(nv(f.density)), ext: cl(nv(f.settings_extruder_temp)), bed: cl(nv(f.settings_bed_temp)),
       initial_weight: r2(nv(s.initial_weight, f.weight)), spool_weight: r2(nv(s.spool_weight, f.spool_weight)), remaining_weight: r2(nv(s.remaining_weight)),
       location: s.location || "", lot_nr: s.lot_nr || "", price: r2(nv(s.price)), comment: s.comment || "",
       tag: String(nv(dec(raw0.tag))), extra: {}, use: D ? (D.use[s.id] || []).slice() : null, tf: tv(f.extra), ts: tv(s.extra) };
