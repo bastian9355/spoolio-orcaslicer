@@ -7190,6 +7190,7 @@ EDITOR_JS = r"""
   var esc = function (s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); };
   var nv = function (a, b) { return a == null || a === "" ? (b == null ? "" : b) : a; };
   var r1 = function (n) { return Math.round(n * 10) / 10; };
+  var r2 = function (n) { return typeof n === "number" ? Math.round(n * 100) / 100 : n; };
   var g = function (n) { return (n === "" || n == null || isNaN(n)) ? "-" : r1(Number(n)).toLocaleString("en-GB") + " g"; };
   var hex = function (c) { c = String(c || "").replace("#", ""); return /^[0-9a-fA-F]{6}/.test(c) ? c.slice(0, 6).toUpperCase() : ""; };
   var dec = function (v) { if (typeof v !== "string") return v; try { return JSON.parse(v); } catch (e) { return v; } };
@@ -7272,8 +7273,8 @@ EDITOR_JS = r"""
     mode = "edit"; cur = s.id; unlock = false; used = "rem"; raw0 = s.extra || {};
     S = { fid: f.id, ext_id: "", name: f.name || "", vendor: (f.vendor || {}).name || "", material: f.material || "", color_hex: hex(f.color_hex),
       diameter: nv(f.diameter), density: nv(f.density), ext: nv(f.settings_extruder_temp), bed: nv(f.settings_bed_temp),
-      initial_weight: nv(s.initial_weight, f.weight), spool_weight: nv(s.spool_weight, f.spool_weight), remaining_weight: nv(s.remaining_weight),
-      location: s.location || "", lot_nr: s.lot_nr || "", price: nv(s.price), comment: s.comment || "",
+      initial_weight: r2(nv(s.initial_weight, f.weight)), spool_weight: r2(nv(s.spool_weight, f.spool_weight)), remaining_weight: r2(nv(s.remaining_weight)),
+      location: s.location || "", lot_nr: s.lot_nr || "", price: r2(nv(s.price)), comment: s.comment || "",
       tag: String(nv(dec(raw0.tag))), extra: {}, use: D ? (D.use[s.id] || []).slice() : null, tf: tv(f.extra), ts: tv(s.extra) };
     M = JSON.parse(JSON.stringify(S)); fillX(); load(); draw();
   }
@@ -7377,7 +7378,7 @@ EDITOR_JS = r"""
     var rem = Number(S.remaining_weight), ini = Number(S.initial_weight), col = "#" + (S.color_hex || "555555"), h = "";
     var opts = mode === "add" ? [[false, "New and Sealed"], [true, "Already Used"]] : [["rem", "Grams Left"], ["use", "Grams Used"]];
     h += '<div class="seg">' + opts.map(function (x) { return '<button data-used="' + x[0] + '" class="' + (used === x[0] ? "on" : "") + '">' + x[1] + '</button>'; }).join("") + '</div>';
-    var main = used === "use" ? '<div class="' + (!same(S.remaining_weight, M.remaining_weight) ? "chg" : "") + '"><label class="fl">Used</label><div class="in"><input data-k="usedg" value="' + r1(ini - rem) + '" style="padding-right:24px"><span class="u">g</span></div></div>'
+    var main = used === "use" ? '<div class="' + (!same(S.remaining_weight, M.remaining_weight) ? "chg" : "") + '"><label class="fl">Used</label><div class="in"><input data-k="usedg" value="' + r2(ini - rem) + '" style="padding-right:24px"><span class="u">g</span></div></div>'
       : (mode === "add" && !used) ? '<div><label class="fl">Remaining</label><div class="in"><input value="' + esc(S.initial_weight) + '" disabled style="padding-right:24px"><span class="u">g</span></div></div>'
       : inp("remaining_weight", "g");
     h += '<div class="f3">' + main + inp("initial_weight", "g", { l: "Filament Weight" }) + inp("spool_weight", "g", { l: "Empty Spool Weight" }) + '</div>';
@@ -7506,7 +7507,7 @@ EDITOR_JS = r"""
     var t = e.target, d = t.dataset;
     if (t.tagName === "SELECT") return;
     keep(function () {
-      if (d.k === "usedg") S.remaining_weight = r1(Number(S.initial_weight) - num(t.value));
+      if (d.k === "usedg") S.remaining_weight = r2(Number(S.initial_weight) - num(t.value));
       else if (d.k) {
         S[d.k] = NUM.indexOf(d.k) >= 0 && t.value !== "" ? num(t.value) : (d.k === "color_hex" ? t.value.replace("#", "").toUpperCase() : t.value);
         if (d.k === "initial_weight" && mode === "add" && !used) S.remaining_weight = S.initial_weight;
