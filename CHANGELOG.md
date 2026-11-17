@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.11.3] - 2026-11-17
+
+### Fixed
+- Fixed an issue where the floating values would carry considerable noise, i.e. a value of 186.5g would be shown as 186.4999999999999g.  It now rounds to 2dp.  Note: this does not apply for advanced calibration as applying the same fix for a pressure advance of 0.025 could become 0.03 for example.
+
 ## [0.11.2] - 2026-11-16
 
 ### Fixed

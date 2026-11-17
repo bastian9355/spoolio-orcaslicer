@@ -6,7 +6,7 @@
 # name = "Spoolio"
 # description = "A Bambu Lab inspired inventory management overview for OrcaSlicer"
 # author = "Dan J Moore"
-# version = "0.11.2"
+# version = "0.11.3"
 # ///
 
 # Spoolio - filament management for OrcaSlicer
@@ -43,7 +43,7 @@ import orca.pages
 _SLICING = hasattr(getattr(orca, "slicing", None), "SlicingPipelineCapabilityBase")
 
 PLUGIN_NAME = "Spoolio"
-PLUGIN_VERSION = "0.11.2"
+PLUGIN_VERSION = "0.11.3"
 # Stamped per operating system by scripts/build.py.
 BUILD_TARGET = "any"
 
