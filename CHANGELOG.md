@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.4] - 2026-11-18
+
+### Fixed
+- Fixed an issue where selecting Sync Now in Configure OrcaSlicer Presets would always say "OrcaSlicer didn't load the presets yet", even with no unsaved edits. If you were signed in to OrcaSlicer and hadn't saved any presets of your own, Spoolio wrote its presets to the wrong user folder. It now asks OrcaSlicer which folder it uses, and checks again if you switch account.
+
+- If OrcaSlicer still refuses to load the presets, the message now tells you why (unsaved edits, another preset based on a Spoolio one, or an invalid preset) rather than always asking you to save or discard your edits.
+
 ## [0.11.3] - 2026-11-17
 
 ### Fixed
