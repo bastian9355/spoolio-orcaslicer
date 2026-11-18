@@ -21,6 +21,7 @@ import logging
 import os
 import platform
 import re
+import shutil
 import socket
 import ssl
 import struct
@@ -2632,6 +2633,64 @@ def _pdir(pb) -> Path:
     return root / "default" / "_local" / PRESET_ID
 
 
+_pfold: dict = {"d": None}
+
+
+def _pfind(pb) -> Path:
+    """The bundle folder in OrcaSlicer's active user folder, checked with list_ids when it can be."""
+    if _pfold["d"]:
+        return _pfold["d"]
+    first = _pdir(pb)
+    ids = getattr(getattr(getattr(getattr(orca, "host", None), "preset", None), "bundles", None), "list_ids", None)
+    if not callable(ids):
+        return first
+    root = DATA_DIR.parent / "user"
+    try:
+        dirs = sorted((x for x in root.iterdir() if x.is_dir() and x.name[:1] not in "_."),
+                      key=lambda x: -x.stat().st_mtime)
+    except OSError:
+        dirs = []
+    seen, cands = set(), []
+    for d in [first] + [x / "_local" / PRESET_ID for x in dirs] + [root / "default" / "_local" / PRESET_ID]:
+        if str(d) not in seen:
+            seen.add(str(d))
+            cands.append(d)
+    meta = json.dumps({"id": PRESET_ID, "name": PLUGIN_NAME, "version": PLUGIN_VERSION})
+    for d in cands:
+        made = not d.is_dir()
+        try:
+            _write(d / "bundle_metadata.json", meta)
+            ok = PRESET_ID in (ids() or [])
+        except Exception as exc:
+            log.warning("Couldn't check preset folder %s: %s", d, exc)
+            ok = False
+        if ok:
+            log.info("OrcaSlicer reads presets from %s", d.parent.parent.name)
+            _pfold["d"] = d
+            return d
+        if made:
+            shutil.rmtree(d, ignore_errors=True)
+    log.warning("OrcaSlicer didn't list Spoolio's bundle in any user folder; using %s", first.parent.parent.name)
+    return first
+
+
+def _perr(exc: Exception) -> str:
+    """A reload refusal from OrcaSlicer, in words the user can act on."""
+    m = str(exc)
+    if "depends on it:" in m:
+        return (f"OrcaSlicer preset \"{m.split('depends on it:', 1)[1].strip()}\" is based on a Spoolio preset. "
+                "Delete it, or save it without that parent, then select Sync Now.")
+    if "modified" in m:
+        return "Save or discard your unsaved preset edits in OrcaSlicer, then select Sync Now."
+    if "invalid preset" in m:
+        return "OrcaSlicer rejected one of Spoolio's presets. Check the base presets for each printer, then select Sync Now."
+    if "does not exist" in m:
+        return "Spoolio couldn't find OrcaSlicer's user preset folder. Restart OrcaSlicer, then select Sync Now."
+    if "not initialized" in m or "FFF printer" in m:
+        return "Select a filament printer and its presets in OrcaSlicer, then select Sync Now."
+    return f"OrcaSlicer didn't load the presets: {m}"
+
+
 _bcache: dict = {"n": -1, "v": []}
 
 
@@ -2788,45 +2847,9 @@ def presets_sync(spools: list | None = None, force: bool = False) -> dict:
     if not _psync.acquire(blocking=False):
         return dict(_pst)
     try:
-        c = parse_presets(cfg().get("presets"))
-        api = _papi()
-        if not api:
-            if c["on"]:
-                _pst.update(err="This version of OrcaSlicer can't add presets.")
-            return dict(_pst)
-        pb, reload = api
-        d = _pdir(pb)
-        fd = d / "filament"
-        if not c["on"] and not fd.is_dir():
-            return dict(_pst)
-        files = {}
-        if c["on"] and source() == "spoolman":
-            if spools is None:
-                url = cfg().get("spoolman_url", "")
-                spools = _spool_cache["spools"] if _spool_cache["url"] == url else get_spools(url).get("spools") or []
-            es = build_presets(c, spools, pb)
-            files = {e["file"]: json.dumps(e["json"], indent=2) + "\n" for e in es}
-            _pmap.clear()
-            _pmap.update({e["json"]["name"]: e for e in es})
-        old = {p.name: p.read_text(encoding="utf-8") for p in fd.glob("*.json")} if fd.is_dir() else {}
-        if files == old and not force and not _pst["err"]:
-            return dict(_pst)
-        _write(d / "bundle_metadata.json", json.dumps({"id": PRESET_ID, "name": PLUGIN_NAME, "version": PLUGIN_VERSION}))
-        for name, text in files.items():
-            if old.get(name) != text:
-                _write(fd / name, text)
-        for name in set(old) - set(files):
-            (fd / name).unlink(missing_ok=True)
-        fd.mkdir(parents=True, exist_ok=True)
-        try:
-            reload(PRESET_ID)
-        except Exception as exc:
-            log.warning("OrcaSlicer didn't reload Spoolio's presets: %s", exc)
-            _pst.update(err="OrcaSlicer didn't load the presets yet. Save or discard any filament preset edits, "
-                            "then select Sync Now.")
-            return dict(_pst)
-        log.info("Synced %d OrcaSlicer filament presets", len(files))
-        _pst.update(n=len(files), time=time.strftime("%H:%M"), err="")
+        for _ in range(2):
+            if _psync_once(spools, force):
+                break
         return dict(_pst)
     except Exception as exc:
         log.exception("Preset sync failed")
@@ -2834,6 +2857,52 @@ def presets_sync(spools: list | None = None, force: bool = False) -> dict:
         return dict(_pst)
     finally:
         _psync.release()
+
+
+def _psync_once(spools: list | None, force: bool) -> bool:
+    """One sync; False when OrcaSlicer's user folder moved and it's worth another go."""
+    c = parse_presets(cfg().get("presets"))
+    api = _papi()
+    if not api:
+        if c["on"]:
+            _pst.update(err="This version of OrcaSlicer can't add presets.")
+        return True
+    pb, reload = api
+    d = _pfind(pb) if c["on"] else (_pfold["d"] or _pdir(pb))
+    fd = d / "filament"
+    if not c["on"] and not fd.is_dir():
+        return True
+    files = {}
+    if c["on"] and source() == "spoolman":
+        if spools is None:
+            url = cfg().get("spoolman_url", "")
+            spools = _spool_cache["spools"] if _spool_cache["url"] == url else get_spools(url).get("spools") or []
+        es = build_presets(c, spools, pb)
+        files = {e["file"]: json.dumps(e["json"], indent=2) + "\n" for e in es}
+        _pmap.clear()
+        _pmap.update({e["json"]["name"]: e for e in es})
+    old = {p.name: p.read_text(encoding="utf-8") for p in fd.glob("*.json")} if fd.is_dir() else {}
+    if files == old and not force and not _pst["err"]:
+        return True
+    _write(d / "bundle_metadata.json", json.dumps({"id": PRESET_ID, "name": PLUGIN_NAME, "version": PLUGIN_VERSION}))
+    for name, text in files.items():
+        if old.get(name) != text:
+            _write(fd / name, text)
+    for name in set(old) - set(files):
+        (fd / name).unlink(missing_ok=True)
+    fd.mkdir(parents=True, exist_ok=True)
+    try:
+        reload(PRESET_ID)
+    except Exception as exc:
+        log.warning("OrcaSlicer didn't reload Spoolio's presets from %s: %s", d, exc)
+        _pst.update(err=_perr(exc))
+        if "does not exist" in str(exc) and _pfold["d"]:
+            _pfold["d"] = None
+            return False
+        return True
+    log.info("Synced %d OrcaSlicer filament presets", len(files))
+    _pst.update(n=len(files), time=time.strftime("%H:%M"), err="")
+    return True
 
 
 def presets_info(want: object = None) -> dict:
