@@ -2931,7 +2931,7 @@ def presets_info(want: object = None) -> dict:
     if c["base"] == "pick" and mats:
         bases = _bases(pb)
         for m in mats:
-            opts = sorted({b["n"].split("@")[0].strip() for b in bases if b["t"] == m})[:80]
+            opts = sorted({b["n"].split("@")[0].strip() for b in bases if b["t"] == m})
             out["materials"].append({"m": m, "opts": opts, "pick": c["bases"].get(m, "")})
     first = next((p for p in out["printers"] if p["on"] and p["group"]), None)
     if first and spools:
