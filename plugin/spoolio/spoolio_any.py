@@ -25,6 +25,7 @@ import shutil
 import socket
 import ssl
 import struct
+import zlib
 import sys
 import tempfile
 import threading
@@ -46,7 +47,7 @@ _SLICING = hasattr(getattr(orca, "slicing", None), "SlicingPipelineCapabilityBas
 PLUGIN_NAME = "Spoolio"
 PLUGIN_VERSION = "0.11.4"
 # Stamped per operating system by scripts/build.py.
-BUILD_TARGET = "any"
+BUILD_TARGET = "win_x86_64"
 
 DEFAULT_SPOOLMAN_URL = "http://raspberrypi:7912"
 LOW_DEFAULT = 100  # grams
@@ -2762,6 +2763,85 @@ def _loaded(spools: list) -> dict[str, set]:
     return out
 
 
+def _valid_preset_version(value: object) -> str:
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,9}(?:[.][0-9]{1,9}){2,3}(?:[-+][0-9A-Za-z.+-]+)?", value):
+        return value
+    return ""
+
+
+def _cached_vendor_version(path: Path, vendor: str) -> str:
+    """Read and verify the vendor stamp in OrcaSlicer's version 2 preset cache."""
+    try:
+        with path.open("rb") as file:
+            magic, fmt, size, crc = struct.unpack("<IIQI", file.read(20))
+            if magic != 0x4F52435A or fmt != 2 or size > 64 * 1024 * 1024:
+                return ""
+            body = file.read(size + 1)
+        if len(body) != size or zlib.crc32(body) != crc or body[:4] != struct.pack("<I", fmt):
+            return ""
+        name = vendor.encode("utf-8")
+        offset = 12 + len(name)
+        if struct.unpack_from("<Q", body, 4)[0] != len(name) or body[12:offset] != name:
+            return ""
+        length = struct.unpack_from("<Q", body, offset)[0]
+        stamp = body[offset + 8:offset + 8 + length]
+        if 0 < length <= 1024 and len(stamp) == length:
+            return _valid_preset_version(stamp.decode("ascii"))
+    except (OSError, ValueError, struct.error):
+        pass
+    return ""
+
+
+def _system_vendor_version(directory: Path) -> str:
+    # Orca assigns the vendor profile's version to every loaded system preset.
+    vendor = directory.name
+    cached = _cached_vendor_version(directory.parent / (vendor + ".opc"), vendor)
+    try:
+        profile = json.loads((directory.parent / (vendor + ".json")).read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return cached
+    except (OSError, ValueError):
+        return ""
+    current = _valid_preset_version(profile.get("version")) if isinstance(profile, dict) else ""
+    if cached and current and re.fullmatch(r"[0-9.]+", cached) and re.fullmatch(r"[0-9.]+", current):
+        def release(value):
+            parts = tuple(map(int, value.split(".")))
+            return parts + (0,) * (4 - len(parts))
+
+        if release(cached) >= release(current):
+            return cached
+    return current
+
+
+def _parent_preset_version(pb, base: str, vendor_versions: dict[Path, str]) -> str:
+    try:
+        parent = pb.filaments.find_preset(base)
+    except Exception:
+        parent = None
+    if parent is not None:
+        try:
+            version = _valid_preset_version(getattr(parent, "version", None))
+            if version:
+                return version
+        except Exception:
+            pass
+        try:
+            path = Path(parent.file or "")
+            if path.is_absolute():
+                for folder in path.parents:
+                    if folder.name.lower() != "filament":
+                        continue
+                    directory = folder.parent
+                    if directory not in vendor_versions:
+                        vendor_versions[directory] = _system_vendor_version(directory)
+                    if vendor_versions[directory]:
+                        return vendor_versions[directory]
+        except (OSError, RuntimeError, TypeError, ValueError, AttributeError):
+            pass
+    log.warning("Could not read version for parent preset %r; using 2.4.0.20", base)
+    return "2.4.0.20"
+
+
 def build_presets(c: dict, spools: list, pb, only: str = "") -> list[dict]:
     """The presets for the ticked printers: one per filament, or per spool."""
     groups = _groups(pb)
@@ -2795,6 +2875,8 @@ def build_presets(c: dict, spools: list, pb, only: str = "") -> list[dict]:
                     else f"{n} #{f.get('id')}"
             label[id(sp)] = f"{x} #{sp['id']}" if c["per"] == "spool" else x
     bases = _bases(pb) if prs else []
+    parent_versions: dict[str, str] = {}
+    vendor_versions: dict[Path, str] = {}
     out = []
     for p, nz in prs:
         for key, sp in picks.items():
@@ -2805,12 +2887,16 @@ def build_presets(c: dict, spools: list, pb, only: str = "") -> list[dict]:
             base = _base(bases, f, nz, c["bases"].get(str(f.get("material") or "").upper(), "") if c["base"] == "pick" else "")
             if not base:
                 continue
-            d = {"type": "filament", "name": name, "from": "User", "instantiation": "true", "inherits": base,
+
+            if base not in parent_versions:
+                parent_versions[base] = _parent_preset_version(pb, base, vendor_versions)
+            version = parent_versions[base]
+            d = {"type": "filament", "name": name, "from": "User", "version": version, "instantiation": "true", "inherits": base,
                  "filament_settings_id": [name], "compatible_printers": nz, "compatible_printers_condition": ""}
             tk = c["take"]
             hx = _first_hex(f)
             if hx and tk["colour"]:
-                d["filament_colour"] = ["#" + hx.upper()]
+                d["default_filament_colour"] = ["#" + hx.upper()]
             ven = (f.get("vendor") or {}).get("name")
             if ven:
                 d["filament_vendor"] = [ven]
@@ -2931,7 +3017,7 @@ def presets_info(want: object = None) -> dict:
     if c["base"] == "pick" and mats:
         bases = _bases(pb)
         for m in mats:
-            opts = sorted({b["n"].split("@")[0].strip() for b in bases if b["t"] == m})[:80]
+            opts = sorted({b["n"].split("@")[0].strip() for b in bases if b["t"] == m})
             out["materials"].append({"m": m, "opts": opts, "pick": c["bases"].get(m, "")})
     first = next((p for p in out["printers"] if p["on"] and p["group"]), None)
     if first and spools:
@@ -8673,7 +8759,23 @@ class SpoolioPage(orca.pages.PagesPluginCapabilityBase):
         elif msg_type == "presets_info":
             _bg(lambda: self._settings_post(presets_info(data.get("cfg"))))
         elif msg_type == "presets_sync":
-            _bg(lambda: (presets_sync(force=True), self._settings_post(presets_info(data.get("cfg")))))
+            wanted = data.get("cfg")
+
+            def sync_now():
+                if isinstance(wanted, dict):
+                    def save_presets(settings):
+                        current = parse_presets(settings.get("presets"))
+                        settings["presets"] = parse_presets({**wanted, "use": current["use"]})
+
+                    if not cfg_edit(save_presets):
+                        info = presets_info(wanted)
+                        info["status"]["err"] = "Couldn't save preset settings. Check the Spoolio log."
+                        self._settings_post(info)
+                        return
+                presets_sync(force=True)
+                self._settings_post(presets_info())
+
+            _bg(sync_now)
         elif msg_type == "feedback":
             open_url(FEEDBACK_URL)
         elif msg_type == "check_update":
